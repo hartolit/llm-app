@@ -1,0 +1,14 @@
+[package]
+name = "context-planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic allocation-free context budgeting and selection"
+publish = false
+
+[dependencies]
+domain-contracts = { path = "../domain-contracts" }
+
+[lints]
+workspace = true

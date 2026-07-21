@@ -1,0 +1,14 @@
+[package]
+name = "tokenization"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Allocation-free tokenization contracts and caller-owned buffers"
+publish = false
+
+[dependencies]
+domain-contracts = { path = "../domain-contracts" }
+
+[lints]
+workspace = true

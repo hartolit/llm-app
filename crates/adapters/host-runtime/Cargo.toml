@@ -1,0 +1,15 @@
+[package]
+name = "host-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Bounded host threading, channels, and monotonic clock adapter"
+publish = false
+
+[dependencies]
+domain-contracts = { path = "../../features/domain-contracts" }
+flume.workspace = true
+
+[lints]
+workspace = true

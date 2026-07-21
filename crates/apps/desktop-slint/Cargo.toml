@@ -1,0 +1,19 @@
+[package]
+name = "desktop-slint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Thin Slint frontend for the reusable application runtime"
+publish = false
+build = "build.rs"
+
+[dependencies]
+application-runtime = { path = "../../engines/application-runtime" }
+slint.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
+
+[lints]
+workspace = true

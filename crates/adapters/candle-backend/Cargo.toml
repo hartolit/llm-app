@@ -1,0 +1,18 @@
+[package]
+name = "candle-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CPU Llama inference adapter implemented with Hugging Face Candle"
+publish = false
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+domain-contracts = { path = "../../features/domain-contracts" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

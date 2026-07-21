@@ -1,0 +1,19 @@
+[package]
+name = "inference-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Exclusive model registry and bounded inference lifecycle engine"
+publish = false
+
+[dependencies]
+domain-contracts = { path = "../../features/domain-contracts" }
+host-runtime = { path = "../../adapters/host-runtime" }
+
+[dev-dependencies]
+candle-backend = { path = "../../adapters/candle-backend" }
+gguf-backend = { path = "../../adapters/gguf-backend" }
+
+[lints]
+workspace = true

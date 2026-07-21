@@ -1,0 +1,89 @@
+import { Button, HorizontalBox, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "LLM App";
+    width: 760px;
+    height: 420px;
+
+    in-out property <string> repository;
+    in-out property <string> revision;
+    in property <string> status-text: "Ready";
+    in property <string> resolved-commit: "Not resolved";
+    in property <bool> busy: false;
+    in property <bool> can-resolve: true;
+    in property <bool> can-load: false;
+    in property <bool> can-unload: false;
+
+    callback resolve-model();
+    callback load-model();
+    callback unload-model();
+
+    VerticalBox {
+        padding: 24px;
+        spacing: 14px;
+
+        Text {
+            text: "Local model lifecycle";
+            font-size: 26px;
+            font-weight: 700;
+        }
+
+        Text {
+            text: "Resolve immutable Hugging Face artifacts, then load or unload the exact model generation.";
+            wrap: word-wrap;
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+            Text { text: "Repository"; width: 110px; vertical-alignment: center; }
+            LineEdit {
+                text <=> root.repository;
+                enabled: !root.busy && !root.can-unload;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+            Text { text: "Revision"; width: 110px; vertical-alignment: center; }
+            LineEdit {
+                text <=> root.revision;
+                enabled: !root.busy && !root.can-unload;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 10px;
+            Button {
+                text: "Resolve & cache";
+                enabled: root.can-resolve;
+                clicked => { root.resolve-model(); }
+            }
+            Button {
+                text: "Load CPU model";
+                enabled: root.can-load && !root.busy && !root.can-unload;
+                clicked => { root.load-model(); }
+            }
+            Button {
+                text: "Unload";
+                enabled: root.can-unload && !root.busy;
+                clicked => { root.unload-model(); }
+            }
+        }
+
+        Rectangle { height: 1px; background: #d0d0d0; }
+
+        Text { text: "Commit: " + root.resolved-commit; }
+        Text {
+            text: root.status-text;
+            wrap: word-wrap;
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        Text {
+            text: "Generation UI is intentionally deferred until the sampling and context orchestration loop is connected.";
+            color: #666666;
+            wrap: word-wrap;
+        }
+    }
+}

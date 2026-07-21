@@ -1,0 +1,13 @@
+[package]
+name = "domain-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable shared vocabulary and engine-backend contracts"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
