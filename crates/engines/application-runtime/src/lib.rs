@@ -11,6 +11,8 @@ mod shutdown;
 mod state;
 mod support;
 
+pub mod workflow;
+
 pub use configuration::{
     ApplicationHubConfiguration, ApplicationPreferences, ApplicationRuntimeConfiguration,
     ApplicationTiming,
@@ -23,3 +25,14 @@ pub use error::{
 pub use event::ApplicationEvent;
 pub use runtime::ApplicationRuntime;
 pub use state::{ApplicationActivity, ApplicationState, LoadedModel, ResolvedModel};
+pub use workflow::{
+    Artifact, ArtifactContent, ArtifactContentKind, ArtifactId, ArtifactInputs, ArtifactKind,
+    ArtifactReference, ArtifactRole, ArtifactStore, CorrectiveWorkflowConfiguration,
+    CorrectiveWorkflowExecutor, Diagnostic, DiagnosticLocation, DiagnosticSeverity, ModelPolicy,
+    ModelTaskExecutor, ModelTaskRequest, NormalizedValidationReport, RawDiagnostic, TaskAttempt,
+    TaskBudget, TaskGraphError, TaskId, TaskKind, ValidationReport, ValidationTaskExecutor,
+    ValidationTaskRequest, ValidationVerdict, WorkflowArtifactLimits, WorkflowBudgetClass,
+    WorkflowConfigurationError, WorkflowError, WorkflowEvent, WorkflowExecutorLimitError,
+    WorkflowExecutorLimits, WorkflowId, WorkflowIdentifierKind, WorkflowOutcome, WorkflowStage,
+    WorkflowStatus, normalize_validation_report,
+};

@@ -139,6 +139,7 @@ dependencies = [
  "host-runtime",
  "inference-runtime",
  "redb-storage",
+ "task-graph",
  "tokenization",
 ]
 

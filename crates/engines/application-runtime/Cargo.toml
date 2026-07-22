@@ -15,6 +15,7 @@ hf-tokenizer = { path = "../../adapters/hf-tokenizer" }
 host-runtime = { path = "../../adapters/host-runtime" }
 inference-runtime = { path = "../inference-runtime" }
 redb-storage = { path = "../../adapters/redb-storage" }
+task-graph = { path = "../../features/task-graph" }
 tokenization = { path = "../../features/tokenization" }
 
 [lints]

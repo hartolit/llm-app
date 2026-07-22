@@ -133,6 +133,29 @@ the generated module; handwritten desktop source remains covered by workspace
 documentation lints. Hosted draining now emits the original unload ticket both
 when the timeout force-cancels work and when the final request finishes naturally.
 
+## Phase 7
+
+Implemented typed corrective workflow orchestration without adding a third engine:
+
+- `task-graph`: semantic artifact roles, allocation-free artifact provenance
+  validation, direct producer/consumer dependency validation, and attempt tokens
+  that reject stale asynchronous completion;
+- `application-runtime`: the canonical draft → validate → normalize diagnostics →
+  review → revise → validate graph, immutable artifact storage, identifier-only
+  task requests and events, restricted declared-input resolution, model-policy
+  forwarding, deterministic diagnostic normalization, bounded aggregate storage and
+  output contracts, operational retries, and accepted/rejected terminal outcomes;
+- coarse `ModelTaskExecutor` and `ValidationTaskExecutor` ports keep model generation,
+  compiler execution, and vendor-specific behavior outside the graph state machine.
+
+Artifact and worst-case event capacity are admitted before any workflow side effect.
+Artifacts are committed before their producing task transitions to success, and all
+completion paths require the active `TaskAttempt`. A validator rejection is a
+successful task result carrying typed diagnostics, while only operational failures
+consume retry attempts. Full specification, draft,
+review, and revision payloads are each stored once and downstream tasks receive
+only `ArtifactId` values. See `docs/project/orchestration.md`.
+
 ## Native maintenance runner
 
 ```text
@@ -148,10 +171,10 @@ cargo run --bin llm-app -- verify
 
 ## Verification state
 
-Phase 4 was compiler- and test-verified by the project owner before Phase 5.
-Phase 6 must be validated locally with:
+Phase 7 is validated with the complete native maintenance sequence above. Desktop
+launch remains a separate target-machine integration check because Slint opens a
+native window and the GGUF adapter compiles upstream C/C++ code:
 
 ```text
-cargo run --bin llm-app -- verify
 cargo run -p desktop-slint
 ```

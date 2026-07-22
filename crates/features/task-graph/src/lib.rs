@@ -20,6 +20,8 @@ pub enum TaskKind {
     CompileCheck,
     /// Run a deterministic validator.
     Validate,
+    /// Normalize raw diagnostics into a stable representation.
+    NormalizeDiagnostics,
     /// Revise an artifact using prior findings.
     Revise,
     /// Aggregate multiple artifacts into one result.
@@ -41,6 +43,28 @@ pub enum ArtifactKind {
     /// Token sequence.
     Tokens,
     /// Application-defined artifact category.
+    Other(u16),
+}
+
+/// Semantic role an artifact serves in a workflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ArtifactRole {
+    /// Workflow specification supplied to generation tasks.
+    Specification,
+    /// Initial generated artifact.
+    Draft,
+    /// Unprocessed diagnostics emitted by a checker.
+    RawDiagnostics,
+    /// Diagnostics normalized for downstream consumption.
+    NormalizedDiagnostics,
+    /// Review findings for a draft or revision.
+    Review,
+    /// Revised artifact produced from prior findings.
+    Revision,
+    /// Final deterministic validation result.
+    FinalValidation,
+    /// Application-defined artifact role.
     Other(u16),
 }
 
@@ -124,6 +148,53 @@ pub struct ArtifactReference {
     pub id: ArtifactId,
     /// Artifact category.
     pub kind: ArtifactKind,
+    /// Semantic role within the workflow.
+    pub role: ArtifactRole,
+}
+
+/// Artifact consumed by one task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskArtifactInput {
+    /// Task that consumes the artifact.
+    pub consumer: TaskId,
+    /// Artifact reference expected by the consumer.
+    pub artifact: ArtifactReference,
+}
+
+/// Artifact produced by one task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskArtifactOutput {
+    /// Task that produces the artifact.
+    pub producer: TaskId,
+    /// Artifact reference emitted by the producer.
+    pub artifact: ArtifactReference,
+}
+
+/// Borrowed artifact declarations and task bindings for a workflow.
+#[derive(Clone, Copy, Debug)]
+pub struct ArtifactFlow<'a> {
+    /// Artifacts supplied externally to the workflow.
+    pub workflow_inputs: &'a [ArtifactReference],
+    /// Artifact bindings consumed by tasks.
+    pub task_inputs: &'a [TaskArtifactInput],
+    /// Artifact bindings produced by tasks.
+    pub task_outputs: &'a [TaskArtifactOutput],
+}
+
+impl<'a> ArtifactFlow<'a> {
+    /// Creates a borrowed artifact-flow view.
+    #[must_use]
+    pub const fn new(
+        workflow_inputs: &'a [ArtifactReference],
+        task_inputs: &'a [TaskArtifactInput],
+        task_outputs: &'a [TaskArtifactOutput],
+    ) -> Self {
+        Self {
+            workflow_inputs,
+            task_inputs,
+            task_outputs,
+        }
+    }
 }
 
 /// Borrowed immutable task graph.
@@ -198,6 +269,61 @@ pub enum TaskGraphError {
     },
     /// Task exhausted its configured attempt budget.
     AttemptLimitReached(TaskId),
+    /// Two workflow inputs share one artifact identity.
+    DuplicateWorkflowInput(ArtifactId),
+    /// A workflow input is also declared as a task output.
+    WorkflowInputProducedByTask(ArtifactId),
+    /// More than one task output uses one artifact identity.
+    DuplicateArtifactProducer(ArtifactId),
+    /// A graph task has no declared artifact output.
+    MissingTaskOutput(TaskId),
+    /// A graph task has more than one declared artifact output.
+    DuplicateTaskOutput(TaskId),
+    /// A task output does not satisfy the node's declared output kind.
+    TaskOutputKindMismatch {
+        /// Task whose output kind is inconsistent.
+        task: TaskId,
+        /// Kind required by the task node.
+        expected: ArtifactKind,
+        /// Kind declared by the artifact output.
+        actual: ArtifactKind,
+    },
+    /// A task input references no workflow input or task output.
+    UnknownArtifact(ArtifactId),
+    /// A task input's kind or role differs from its source declaration.
+    ArtifactReferenceMismatch {
+        /// Complete reference declared by the source.
+        expected: ArtifactReference,
+        /// Complete reference requested by the consumer.
+        actual: ArtifactReference,
+    },
+    /// The same task input binding was declared more than once.
+    DuplicateTaskArtifactInput(TaskArtifactInput),
+    /// A task consumes an artifact that it produces itself.
+    SelfArtifactConsumption {
+        /// Task consuming its own output.
+        task: TaskId,
+        /// Self-produced artifact identity.
+        artifact: ArtifactId,
+    },
+    /// A produced artifact is consumed without a direct graph dependency.
+    MissingArtifactDependency {
+        /// Task producing the consumed artifact.
+        producer: TaskId,
+        /// Task consuming the produced artifact.
+        consumer: TaskId,
+        /// Artifact requiring the dependency.
+        artifact: ArtifactId,
+    },
+    /// A completion token is stale or does not identify a running attempt.
+    InvalidAttempt {
+        /// Attempt supplied by the caller.
+        attempt: TaskAttempt,
+        /// Current attempt identity, when the task has been started.
+        active: Option<TaskAttempt>,
+        /// Current runtime status of the task.
+        state: TaskStatus,
+    },
 }
 
 impl From<CapacityExhausted> for TaskGraphError {
@@ -312,6 +438,54 @@ pub fn validate_graph(
     }
 }
 
+/// Validates artifact provenance and direct task-to-task data dependencies.
+///
+/// Validation uses only borrowed declarations and repeated slice scans; it does
+/// not allocate or require caller-owned scratch storage.
+///
+/// # Errors
+///
+/// Returns [`TaskGraphError::UnknownTask`] for bindings involving absent tasks;
+/// [`TaskGraphError::DuplicateWorkflowInput`],
+/// [`TaskGraphError::WorkflowInputProducedByTask`], or
+/// [`TaskGraphError::DuplicateArtifactProducer`] for ambiguous artifact sources;
+/// [`TaskGraphError::MissingTaskOutput`],
+/// [`TaskGraphError::DuplicateTaskOutput`], or
+/// [`TaskGraphError::TaskOutputKindMismatch`] for invalid output declarations;
+/// [`TaskGraphError::UnknownArtifact`] or
+/// [`TaskGraphError::ArtifactReferenceMismatch`] for an input without an exact
+/// source; [`TaskGraphError::DuplicateTaskArtifactInput`] for a repeated binding;
+/// [`TaskGraphError::SelfArtifactConsumption`] for a task consuming its own
+/// output; and [`TaskGraphError::MissingArtifactDependency`] when a consumer has
+/// no direct dependency on the task producing its input.
+pub fn validate_artifact_flow(
+    graph: &TaskGraph<'_>,
+    flow: &ArtifactFlow<'_>,
+) -> Result<(), TaskGraphError> {
+    validate_artifact_tasks(graph, flow)?;
+    validate_workflow_inputs(flow)?;
+    validate_task_outputs(graph, flow)?;
+    validate_task_output_contracts(graph, flow)?;
+    validate_task_inputs(graph, flow)
+}
+
+/// Identity of one started execution attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskAttempt {
+    /// Task being executed.
+    pub task: TaskId,
+    /// One-based attempt number for the task.
+    pub number: NonZeroU16,
+}
+
+impl TaskAttempt {
+    /// Creates an attempt identity.
+    #[must_use]
+    pub const fn new(task: TaskId, number: NonZeroU16) -> Self {
+        Self { task, number }
+    }
+}
+
 /// Runtime state of one task.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -382,7 +556,11 @@ impl<'a> TaskStateTable<'a> {
     /// unavailable, [`TaskGraphError::InvalidTransition`] when the task is not
     /// pending or failed or its prerequisites have not succeeded, and
     /// [`TaskGraphError::AttemptLimitReached`] when its attempt budget is spent.
-    pub fn start(&mut self, graph: &TaskGraph<'_>, task_id: TaskId) -> Result<(), TaskGraphError> {
+    pub fn start(
+        &mut self,
+        graph: &TaskGraph<'_>,
+        task_id: TaskId,
+    ) -> Result<TaskAttempt, TaskGraphError> {
         let index = graph
             .node_index(task_id)
             .ok_or(TaskGraphError::UnknownTask(task_id))?;
@@ -413,48 +591,56 @@ impl<'a> TaskStateTable<'a> {
         let Some(state) = self.states.get_mut(index) else {
             return Err(TaskGraphError::UnknownTask(task_id));
         };
-        state.attempts = state.attempts.saturating_add(1);
+        let Some(number) = NonZeroU16::new(current.attempts.saturating_add(1)) else {
+            return Err(TaskGraphError::AttemptLimitReached(task_id));
+        };
+        state.attempts = number.get();
         state.status = TaskStatus::Running;
+        Ok(TaskAttempt::new(task_id, number))
+    }
+
+    /// Marks the running attempt identified by `attempt` successful.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskGraphError::UnknownTask`] when the token's task or state is
+    /// absent, or [`TaskGraphError::InvalidAttempt`] when the token is stale or
+    /// the identified task is not running.
+    pub fn succeed_attempt(
+        &mut self,
+        graph: &TaskGraph<'_>,
+        attempt: TaskAttempt,
+    ) -> Result<(), TaskGraphError> {
+        let index = self.validate_attempt(graph, attempt)?;
+        let Some(state) = self.states.get_mut(index) else {
+            return Err(TaskGraphError::UnknownTask(attempt.task));
+        };
+        state.status = TaskStatus::Succeeded;
         Ok(())
     }
 
-    /// Marks a running task successful.
+    /// Marks the running attempt identified by `attempt` failed.
+    ///
+    /// The task becomes exhausted when this attempt spends its retry budget.
     ///
     /// # Errors
     ///
-    /// Returns [`TaskGraphError::UnknownTask`] when the task or its state is
-    /// absent, or [`TaskGraphError::InvalidTransition`] when it is not running.
-    pub fn succeed(
+    /// Returns [`TaskGraphError::UnknownTask`] when the token's task or state is
+    /// absent, or [`TaskGraphError::InvalidAttempt`] when the token is stale or
+    /// the identified task is not running.
+    pub fn fail_attempt(
         &mut self,
         graph: &TaskGraph<'_>,
-        task_id: TaskId,
+        attempt: TaskAttempt,
     ) -> Result<(), TaskGraphError> {
-        self.transition_from_running(graph, task_id, TaskStatus::Succeeded)
-    }
-
-    /// Marks a running task failed and records terminal exhaustion when no retry remains.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TaskGraphError::UnknownTask`] when the task or its state is
-    /// absent, or [`TaskGraphError::InvalidTransition`] when it is not running.
-    pub fn fail(&mut self, graph: &TaskGraph<'_>, task_id: TaskId) -> Result<(), TaskGraphError> {
-        let index = graph
-            .node_index(task_id)
-            .ok_or(TaskGraphError::UnknownTask(task_id))?;
+        let index = self.validate_attempt(graph, attempt)?;
         let node = graph
             .nodes
             .get(index)
-            .ok_or(TaskGraphError::UnknownTask(task_id))?;
+            .ok_or(TaskGraphError::UnknownTask(attempt.task))?;
         let Some(state) = self.states.get_mut(index) else {
-            return Err(TaskGraphError::UnknownTask(task_id));
+            return Err(TaskGraphError::UnknownTask(attempt.task));
         };
-        if state.status != TaskStatus::Running {
-            return Err(TaskGraphError::InvalidTransition {
-                task: task_id,
-                state: state.status,
-            });
-        }
         state.status = if state.attempts >= node.budget.maximum_attempts.get() {
             TaskStatus::Exhausted
         } else {
@@ -565,27 +751,172 @@ impl<'a> TaskStateTable<'a> {
         Ok(written)
     }
 
-    fn transition_from_running(
-        &mut self,
+    fn validate_attempt(
+        &self,
         graph: &TaskGraph<'_>,
-        task_id: TaskId,
-        next: TaskStatus,
-    ) -> Result<(), TaskGraphError> {
+        attempt: TaskAttempt,
+    ) -> Result<usize, TaskGraphError> {
         let index = graph
-            .node_index(task_id)
-            .ok_or(TaskGraphError::UnknownTask(task_id))?;
-        let Some(state) = self.states.get_mut(index) else {
-            return Err(TaskGraphError::UnknownTask(task_id));
-        };
-        if state.status != TaskStatus::Running {
-            return Err(TaskGraphError::InvalidTransition {
-                task: task_id,
+            .node_index(attempt.task)
+            .ok_or(TaskGraphError::UnknownTask(attempt.task))?;
+        let state = self
+            .states
+            .get(index)
+            .copied()
+            .ok_or(TaskGraphError::UnknownTask(attempt.task))?;
+        let active =
+            NonZeroU16::new(state.attempts).map(|number| TaskAttempt::new(attempt.task, number));
+        if state.status != TaskStatus::Running || active != Some(attempt) {
+            return Err(TaskGraphError::InvalidAttempt {
+                attempt,
+                active,
                 state: state.status,
             });
         }
-        state.status = next;
-        Ok(())
+        Ok(index)
     }
+}
+
+fn validate_artifact_tasks(
+    graph: &TaskGraph<'_>,
+    flow: &ArtifactFlow<'_>,
+) -> Result<(), TaskGraphError> {
+    for input in flow.task_inputs {
+        if graph.node(input.consumer).is_none() {
+            return Err(TaskGraphError::UnknownTask(input.consumer));
+        }
+    }
+    for output in flow.task_outputs {
+        if graph.node(output.producer).is_none() {
+            return Err(TaskGraphError::UnknownTask(output.producer));
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_inputs(flow: &ArtifactFlow<'_>) -> Result<(), TaskGraphError> {
+    for (left_index, input) in flow.workflow_inputs.iter().enumerate() {
+        let Some(tail) = flow.workflow_inputs.get(left_index.saturating_add(1)..) else {
+            continue;
+        };
+        if tail.iter().any(|other| other.id == input.id) {
+            return Err(TaskGraphError::DuplicateWorkflowInput(input.id));
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_outputs(
+    _graph: &TaskGraph<'_>,
+    flow: &ArtifactFlow<'_>,
+) -> Result<(), TaskGraphError> {
+    for (left_index, output) in flow.task_outputs.iter().enumerate() {
+        if flow
+            .workflow_inputs
+            .iter()
+            .any(|input| input.id == output.artifact.id)
+        {
+            return Err(TaskGraphError::WorkflowInputProducedByTask(
+                output.artifact.id,
+            ));
+        }
+        let Some(tail) = flow.task_outputs.get(left_index.saturating_add(1)..) else {
+            continue;
+        };
+        if tail
+            .iter()
+            .any(|other| other.artifact.id == output.artifact.id)
+        {
+            return Err(TaskGraphError::DuplicateArtifactProducer(
+                output.artifact.id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_output_contracts(
+    graph: &TaskGraph<'_>,
+    flow: &ArtifactFlow<'_>,
+) -> Result<(), TaskGraphError> {
+    for node in graph.nodes {
+        let mut matching = flow
+            .task_outputs
+            .iter()
+            .filter(|output| output.producer == node.id);
+        let Some(output) = matching.next() else {
+            return Err(TaskGraphError::MissingTaskOutput(node.id));
+        };
+        if matching.next().is_some() {
+            return Err(TaskGraphError::DuplicateTaskOutput(node.id));
+        }
+        if output.artifact.kind != node.output.kind {
+            return Err(TaskGraphError::TaskOutputKindMismatch {
+                task: node.id,
+                expected: node.output.kind,
+                actual: output.artifact.kind,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_task_inputs(
+    graph: &TaskGraph<'_>,
+    flow: &ArtifactFlow<'_>,
+) -> Result<(), TaskGraphError> {
+    for (left_index, input) in flow.task_inputs.iter().enumerate() {
+        let Some(tail) = flow.task_inputs.get(left_index.saturating_add(1)..) else {
+            continue;
+        };
+        if tail.iter().any(|other| other == input) {
+            return Err(TaskGraphError::DuplicateTaskArtifactInput(*input));
+        }
+
+        if let Some(source) = flow
+            .workflow_inputs
+            .iter()
+            .find(|source| source.id == input.artifact.id)
+        {
+            validate_artifact_reference(*source, input.artifact)?;
+            continue;
+        }
+
+        let Some(output) = flow
+            .task_outputs
+            .iter()
+            .find(|output| output.artifact.id == input.artifact.id)
+        else {
+            return Err(TaskGraphError::UnknownArtifact(input.artifact.id));
+        };
+        validate_artifact_reference(output.artifact, input.artifact)?;
+        if output.producer == input.consumer {
+            return Err(TaskGraphError::SelfArtifactConsumption {
+                task: input.consumer,
+                artifact: input.artifact.id,
+            });
+        }
+        if !graph.dependencies.iter().any(|dependency| {
+            dependency.prerequisite == output.producer && dependency.dependent == input.consumer
+        }) {
+            return Err(TaskGraphError::MissingArtifactDependency {
+                producer: output.producer,
+                consumer: input.consumer,
+                artifact: input.artifact.id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_artifact_reference(
+    expected: ArtifactReference,
+    actual: ArtifactReference,
+) -> Result<(), TaskGraphError> {
+    if expected != actual {
+        return Err(TaskGraphError::ArtifactReferenceMismatch { expected, actual });
+    }
+    Ok(())
 }
 
 fn validate_scratch(

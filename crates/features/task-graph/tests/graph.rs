@@ -4,9 +4,9 @@ use core::num::NonZeroU16;
 
 use domain_contracts::{BackendId, TaskId};
 use task_graph::{
-    ArtifactKind, GraphValidationScratch, ModelPolicy, TaskBudget, TaskDependency, TaskGraph,
-    TaskGraphError, TaskKind, TaskNode, TaskOutputContract, TaskRuntimeState, TaskStateTable,
-    TaskStatus, validate_graph,
+    ArtifactKind, GraphValidationScratch, ModelPolicy, TaskAttempt, TaskBudget, TaskDependency,
+    TaskGraph, TaskGraphError, TaskKind, TaskNode, TaskOutputContract, TaskRuntimeState,
+    TaskStateTable, TaskStatus, validate_graph,
 };
 
 fn node(id: u64, kind: TaskKind) -> Result<TaskNode, &'static str> {
@@ -103,11 +103,11 @@ fn runtime_state_releases_dependents_only_after_success() -> Result<(), &'static
     );
     assert_eq!(ready[0], TaskId::new(1));
 
-    table
+    let attempt = table
         .start(&graph, TaskId::new(1))
         .map_err(|_| "start failed")?;
     table
-        .succeed(&graph, TaskId::new(1))
+        .succeed_attempt(&graph, attempt)
         .map_err(|_| "success failed")?;
 
     assert_eq!(
@@ -122,6 +122,81 @@ fn runtime_state_releases_dependents_only_after_success() -> Result<(), &'static
             .state(&graph, TaskId::new(1))
             .map(|state| state.status),
         Some(TaskStatus::Succeeded)
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_attempt_token_cannot_complete_a_retry() -> Result<(), &'static str> {
+    let nodes = [node(1, TaskKind::Draft)?];
+    let graph = TaskGraph::new(&nodes, &[]);
+    let mut states = [TaskRuntimeState::default(); 1];
+    let mut table = TaskStateTable::new(&graph, &mut states).map_err(|_| "state table rejected")?;
+
+    let first = table
+        .start(&graph, TaskId::new(1))
+        .map_err(|_| "first start failed")?;
+    table
+        .fail_attempt(&graph, first)
+        .map_err(|_| "first failure failed")?;
+    let second = table
+        .start(&graph, TaskId::new(1))
+        .map_err(|_| "retry start failed")?;
+
+    assert_eq!(
+        table.succeed_attempt(&graph, first),
+        Err(TaskGraphError::InvalidAttempt {
+            attempt: first,
+            active: Some(second),
+            state: TaskStatus::Running,
+        })
+    );
+    table
+        .succeed_attempt(&graph, second)
+        .map_err(|_| "current attempt rejected")?;
+    assert_eq!(
+        table
+            .state(&graph, TaskId::new(1))
+            .map(|state| state.status),
+        Some(TaskStatus::Succeeded)
+    );
+    Ok(())
+}
+
+#[test]
+fn completion_requires_the_active_attempt_identity() -> Result<(), &'static str> {
+    let nodes = [node(1, TaskKind::Draft)?];
+    let graph = TaskGraph::new(&nodes, &[]);
+    let mut states = [TaskRuntimeState::default(); 1];
+    let mut table = TaskStateTable::new(&graph, &mut states).map_err(|_| "state table rejected")?;
+    let active = table
+        .start(&graph, TaskId::new(1))
+        .map_err(|_| "start failed")?;
+    let wrong_number = NonZeroU16::new(2).ok_or("attempt count must be non-zero")?;
+    let wrong = TaskAttempt::new(TaskId::new(1), wrong_number);
+
+    assert_eq!(
+        table.fail_attempt(&graph, wrong),
+        Err(TaskGraphError::InvalidAttempt {
+            attempt: wrong,
+            active: Some(active),
+            state: TaskStatus::Running,
+        })
+    );
+    assert_eq!(
+        table
+            .state(&graph, TaskId::new(1))
+            .map(|state| state.status),
+        Some(TaskStatus::Running)
+    );
+    table
+        .fail_attempt(&graph, active)
+        .map_err(|_| "active attempt rejected")?;
+    assert_eq!(
+        table
+            .state(&graph, TaskId::new(1))
+            .map(|state| state.status),
+        Some(TaskStatus::Failed)
     );
     Ok(())
 }
@@ -147,17 +222,17 @@ fn failed_prerequisite_blocks_descendants() -> Result<(), &'static str> {
     let mut states = [TaskRuntimeState::default(); 3];
     let mut table = TaskStateTable::new(&graph, &mut states).map_err(|_| "state table rejected")?;
 
-    table
+    let first = table
         .start(&graph, TaskId::new(1))
         .map_err(|_| "first start failed")?;
     table
-        .fail(&graph, TaskId::new(1))
+        .fail_attempt(&graph, first)
         .map_err(|_| "first failure transition failed")?;
-    table
+    let second = table
         .start(&graph, TaskId::new(1))
         .map_err(|_| "retry start failed")?;
     table
-        .fail(&graph, TaskId::new(1))
+        .fail_attempt(&graph, second)
         .map_err(|_| "terminal failure transition failed")?;
     assert_eq!(
         table
