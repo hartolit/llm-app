@@ -30,6 +30,7 @@ These documents describe current policy. Changes to an accepted architectural de
 - [ADR-0004: Deliver direct completion before general chat](decisions/0004-direct-completion-before-chat.md)
 - [ADR-0005: Retain the current crate folders](decisions/0005-retain-crate-folders.md)
 - [ADR-0006: Require explicit bounded shutdown](decisions/0006-explicit-bounded-shutdown.md)
+- [ADR-0007: Name the supported portability targets](decisions/0007-portability-targets.md)
 
 ADRs record context, rejected alternatives, consequences, and review triggers. An ADR marked superseded is historical and no longer has precedence.
 
@@ -52,6 +53,8 @@ The status page is the canonical answer to “what works now?” A claim of vali
 - [GGUF backend](project/gguf-backend.md)
 - [Corrective workflow](project/orchestration.md)
 - [Performance evidence](project/performance.md)
+- [Dependency and repository policy](project/dependency-policy.md)
+- [Portable feature targets](project/portability.md)
 
 Component guides explain implemented behavior within one subsystem. They do not override an ADR, normative architecture, or current status.
 

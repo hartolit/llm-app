@@ -29,7 +29,7 @@ Every architectural statement should be understood as one of these classes:
 - `inference-runtime` does not import `application-runtime` or an application.
 - Application production code enters model lifecycle behavior through `application-runtime`, rather than bypassing it to compose E0 and adapters independently.
 
-The current validator enforces workspace-local path dependencies only. It does not yet fail closed on unknown paths, distinguish dependency kinds, or enforce external dependency policy; those are Phase 1 work and must not be claimed as current guarantees.
+The architecture validator loads typed Cargo metadata, fails closed on unknown workspace locations and local path targets, distinguishes normal/build/development dependencies, tests the complete layer matrix, and enforces reviewed external dependency policy. Exact exceptions and their justifications are inspectable in the validator; the [dependency policy guide](project/dependency-policy.md) summarizes the enforced rules.
 
 ### Unsafe code
 

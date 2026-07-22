@@ -9,8 +9,7 @@ publish = false
 default-run = "llm-app"
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
+cargo_metadata.workspace = true
 
 [workspace]
 members = [
@@ -49,6 +48,7 @@ default-members = [
 resolver = "3"
 
 [workspace.dependencies]
+cargo_metadata = "0.23.1"
 application-runtime = { path = "crates/engines/application-runtime" }
 candle-backend = { path = "crates/adapters/candle-backend" }
 context-planner = { path = "crates/features/context-planner" }

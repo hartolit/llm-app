@@ -136,7 +136,7 @@ Every work package should follow these rules.
    - this plan;
    - `docs/README.md` once Phase 0 creates it;
    - the component document relevant to the package.
-2. Run the repository baseline command before editing. During early phases this is `cargo run --bin llm-app -- verify`; after the xtask migration it is `cargo xtask verify`.
+2. Run the repository baseline command before editing. During early phases this is `cargo run --locked --bin llm-app -- verify`; after the xtask migration it is `cargo xtask verify`.
 3. Do not mix phases in one change unless the later change is required to make the earlier one compile.
 4. Preserve public APIs unless the work package explicitly authorizes an API change.
 5. Add tests for every new invariant and every reproduced failure.
@@ -290,7 +290,7 @@ Required checks:
 
 ```text
 cargo fmt --all -- --check
-cargo run --bin llm-app -- architecture
+cargo run --locked --bin llm-app -- architecture
 cargo check --workspace --all-targets --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings

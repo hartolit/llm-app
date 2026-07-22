@@ -97,7 +97,7 @@ traverse every layer. Adapters quarantine vendor, FFI, filesystem, network,
 database, and OS dependencies. Engines coordinate state and lifetimes.
 Applications own the event loop, environment-specific paths, and presentation.
 
-No crate may depend upward. Adapter crates do not import one another.
+No production crate may depend upward. Adapter crates do not import one another. Development dependencies are reviewed separately and may cross production direction only for an explicitly named compatibility test or benchmark.
 
 ## Current members
 
@@ -138,6 +138,10 @@ desktop-slint       -> application-runtime + slint
 inference commands directly. Slint types remain confined to the application
 crate, and application-runtime public events expose stable application/domain
 values rather than vendor types.
+
+The validator uses typed Cargo metadata, fails closed on unknown workspace
+locations and path targets, distinguishes dependency kinds, and applies the
+external dependency rules documented in the [dependency policy](dependency-policy.md).
 
 ## Generated-code lint boundary
 

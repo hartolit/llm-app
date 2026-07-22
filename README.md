@@ -32,16 +32,16 @@ The current dependency policy and its enforcement scope are documented in [the a
 Run the current repository baseline gate with:
 
 ```text
-cargo run --bin llm-app -- verify
+cargo run --locked --bin llm-app -- verify
 ```
 
-The root binary currently runs architecture validation, formatting checks, workspace checks, tests, and Clippy. This runner will be replaced by the planned `xtask` only after the earlier execution-plan gates are complete.
+The root binary runs the Phase 1 architecture, formatting, workspace-check, ordinary-test, Clippy, API-documentation, and benchmark-compilation gates. Ordinary tests do not select benchmark targets. CI also enforces dependency policy, local Markdown links, and the named portable targets. This runner will be replaced by the planned `xtask` only after the earlier execution-plan gates are complete.
 
 Plain Cargo commands also work normally:
 
 ```text
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --all-targets --locked
+cargo test --workspace --locked
 ```
 
 ## Slint frontend
@@ -60,3 +60,12 @@ Relevant guides:
 - [Desktop runtime](docs/project/desktop-runtime.md)
 - [Candle backend](docs/project/candle-backend.md)
 - [GGUF backend](docs/project/gguf-backend.md)
+
+## License
+
+Project-authored source is available under either of:
+
+- [Apache License 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+Third-party dependencies retain their own terms; the reviewed policy and Slint licensing note are documented in the [dependency policy](docs/project/dependency-policy.md).
