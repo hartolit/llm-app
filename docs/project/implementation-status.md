@@ -153,7 +153,6 @@ Artifacts are committed before their producing task transitions to success, and 
 completion paths require the active `TaskAttempt`. A validator rejection is a
 successful task result carrying typed diagnostics, while only operational failures
 consume retry attempts. Full specification, draft,
-Full specification, draft,
 review, and revision payloads are each stored once and downstream tasks receive
 only `ArtifactId` values. See `docs/project/orchestration.md`.
 
@@ -167,20 +166,26 @@ The initial optimization and enforcement baseline is implemented:
   adapter, engine, and application tiers;
 - application crates are restricted to the E1 `application-runtime` boundary
   rather than directly composing E0, adapters, or features;
-- an instrumented test allocator fails the portable checked prefill/decode test
-  when the prepared execution region allocates or reallocates.
+- instrumented test allocators fail the portable checked prefill/decode and
+  production sampling tests when prepared execution allocates or reallocates;
+- the production default sampling pipeline has a Criterion benchmark over a
+  vocabulary-sized flat working set, reporting per-sample latency and processed
+  logit throughput with a documented cache footprint and machine-local baseline.
+  See `docs/project/performance.md`.
 
 The allocation gate covers project-owned `domain-contracts` dispatch and
 caller-owned buffers. It does not claim that Candle or llama.cpp execution is
 allocation-free; neither backend advertises that capability. Backend-native
-allocation and observed-memory measurement, latency and throughput benchmarks,
-cache-footprint analysis, and timing stress tests remain later Phase 8 work.
+allocation and observed-memory measurement, benchmarks for backend execution and
+other portable algorithms, backend cache-footprint analysis, and timing stress tests
+remain later Phase 8 work.
 
 ## Native maintenance runner
 
 ```text
 cargo fmt --all -- --check
 cargo run --bin llm-app -- architecture
+cargo run --bin llm-app -- benchmark
 cargo run --bin llm-app -- check
 cargo run --bin llm-app -- test
 cargo run --bin llm-app -- fmt
@@ -191,9 +196,9 @@ cargo run --bin llm-app -- verify
 
 ## Verification state
 
-Phase 7 is validated with the complete native maintenance sequence above. Desktop
-launch remains a separate target-machine integration check because Slint opens a
-native window and the GGUF adapter compiles upstream C/C++ code:
+The current Phase 8 baseline is validated with the complete native maintenance
+sequence above. Desktop launch remains a separate target-machine integration
+check because Slint opens a native window and the GGUF adapter compiles upstream C/C++ code:
 
 ```text
 cargo run -p desktop-slint

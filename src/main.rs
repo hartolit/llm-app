@@ -19,6 +19,7 @@ USAGE:
 
 COMMANDS:
     architecture Validate layered workspace dependency directions
+    benchmark    Measure portable hot-path latency and throughput
     check        Compile every workspace target
     test         Run every workspace test
     fmt          Format the workspace
@@ -53,6 +54,7 @@ fn execute() -> io::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         "architecture" => validate_architecture(),
+        "benchmark" => run_cargo(&["bench", "-p", "sampling", "--bench", "sampling_pipeline"]),
         "check" => run_cargo(&["check", "--workspace", "--all-targets", "--all-features"]),
         "test" => run_cargo(&["test", "--workspace", "--all-targets", "--all-features"]),
         "fmt" => run_cargo(&["fmt", "--all"]),

@@ -11,5 +11,13 @@ publish = false
 domain-contracts.workspace = true
 libm.workspace = true
 
+[dev-dependencies]
+criterion.workspace = true
+stats_alloc.workspace = true
+
+[[bench]]
+name = "sampling_pipeline"
+harness = false
+
 [lints]
 workspace = true

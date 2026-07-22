@@ -77,6 +77,7 @@ redb = { version = "4.1.0", default-features = false }
 slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2"] }
 slint-build = "1.17.1"
 stats_alloc = "0.1.10"
+criterion = { version = "0.8.2", default-features = false }
 
 [workspace.package]
 version = "0.1.0"
