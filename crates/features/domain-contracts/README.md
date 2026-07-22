@@ -12,4 +12,4 @@ Portable, allocation-neutral contracts shared by inference engines and concrete 
 - UI output is modeled as a bounded, pull-oriented batch; output saturation yields generation.
 - The crate is always `no_std` and contains no mandatory heap allocation or third-party dependency.
 
-The lifecycle state machine escalates timed-out drains to cancellation. Actual hard reclamation still requires bounded backend calls or process isolation; see `docs/lifecycle.md`.
+The lifecycle state machine escalates timed-out drains to cancellation. Actual hard reclamation still requires bounded backend calls or process isolation; see the [lifecycle guide](../../../docs/project/lifecycle.md).

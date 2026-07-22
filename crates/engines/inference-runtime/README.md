@@ -8,5 +8,5 @@ cancellation, bounded drain escalation, synchronization, and unload. The
 synchronous `InferenceRuntime` API is the source of truth; the hosted worker adds
 bounded commands and events through `host-runtime` without changing ownership.
 
-See `docs/inference-runtime.md` for lifecycle guarantees and current concurrency
-limitations.
+See the [inference runtime guide](../../../docs/project/inference-runtime.md) for
+lifecycle guarantees and current concurrency limitations.

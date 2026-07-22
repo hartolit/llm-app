@@ -1,90 +1,62 @@
-# HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced
-
 # llm-app
 
-A layered Rust workspace for local language-model inference, context planning,
-sampling, orchestration, persistence, and replaceable application frontends.
+A layered Rust workspace for local, CPU-only language-model inference, context planning, sampling, orchestration, persistence, and a replaceable native frontend.
 
-The repository currently contains:
+## Current product state
 
-- Phase 1: portable backend and lifecycle contracts;
-- Phase 2: tokenization, context planning, sampling, and task-graph features;
-- Phase 3: Candle CPU Llama reference backend;
-- Phase 4: exclusive-ownership inference runtime and bounded host transport;
-- Phase 5: Hugging Face artifact/tokenizer adapters, redb persistence, a
-  frontend-neutral application runtime, and a thin Slint runner;
-- Phase 6: a second CPU backend for local GGUF models through llama.cpp.
+The currently composed application path uses Candle on the CPU with Hugging Face artifacts and tokenization. It can resolve, validate, load, drain, unload, and persist the selection for one model generation through the frontend-neutral `application-runtime` façade and the Slint application.
 
-The Phase 5 application runtime resolves a mutable Hub reference to one immutable
-commit, caches that exact artifact set, validates the tokenizer and declared
-scalar type, persists logical model selections, and loads or unloads one CPU
-model generation. Slint only maps callbacks and structured events to widgets.
-A Tauri, CLI, or another native frontend can consume `application-runtime`
-without duplicating Hub, storage, tokenizer, or inference lifecycle logic.
+A GGUF/llama.cpp CPU adapter also implements the lower inference compatibility boundary. It is not selectable through `application-runtime` or the Slint UI yet.
 
-Chat generation remains deliberately absent until context planning, prompt
-rendering, sampling, streaming decode, and generation scheduling are connected
-as one tested loop.
+Backend prefill/decode primitives exist, but the repository does **not** currently expose an integrated prompt-to-stream generation loop. In particular:
+
+- direct completion is the first planned generation mode, not current functionality;
+- general chat rendering and conversation history come after that direct-completion slice;
+- GPU execution, remote transport, and multiple application-level resident models are not supported.
+
+See the [current implementation status](docs/project/implementation-status.md) for the exact integration matrix and validation evidence. The [execution plan](docs/execution/execution-plan.md) is the active roadmap.
 
 ## Workspace
 
 ```text
-crates/features/domain-contracts
-crates/features/tokenization
-crates/features/context-planner
-crates/features/sampling
-crates/features/task-graph
-crates/adapters/candle-backend
-crates/adapters/gguf-backend
-crates/adapters/host-runtime
-crates/adapters/hf-tokenizer
-crates/adapters/hf-hub
-crates/adapters/redb-storage
-crates/engines/inference-runtime
-crates/engines/application-runtime
-crates/apps/desktop-slint
+crates/features/     portable contracts and algorithms
+crates/adapters/     model, tokenizer, storage, network, and host integrations
+crates/engines/      inference ownership and application use cases
+crates/apps/         presentation and process entry points
 ```
 
-`domain-contracts` is the shared F0 leaf foundation. F1 feature crates may
-depend on it but never on one another. `inference-runtime` is the E0 model and
-sequence owner. `application-runtime` is the E1 use-case coordinator and may
-depend downward on E0. Vendor, filesystem, network, database, and operating-
-system dependencies remain quarantined in adapters.
+The current dependency policy and its enforcement scope are documented in [the architecture](docs/architecture.md). Documentation authority and all component guides are indexed in [the documentation map](docs/README.md).
 
 ## Validate
 
-Use the explicit root Rust runner binary:
+Run the current repository baseline gate with:
 
 ```text
 cargo run --bin llm-app -- verify
 ```
 
-Individual commands are available through:
+The root binary currently runs architecture validation, formatting checks, workspace checks, tests, and Clippy. This runner will be replaced by the planned `xtask` only after the earlier execution-plan gates are complete.
+
+Plain Cargo commands also work normally:
 
 ```text
-cargo run --bin llm-app -- help
-```
-
-The root package declares `default-run = "llm-app"`, but workspace binary
-selection can still vary with Cargo invocation context. Documentation therefore
-uses the explicit binary form so commands remain unambiguous as more runners are
-added.
-
-Plain Cargo commands work normally:
-
-```text
-cargo check
-cargo test
+cargo check --workspace
+cargo test --workspace
 ```
 
 ## Slint frontend
+
+Run the native frontend with:
 
 ```text
 cargo run -p desktop-slint
 ```
 
-The initial frontend still uses the CPU Candle backend; Phase 6 adds the GGUF
-adapter at the engine boundary but does not yet expose backend selection in the
-UI. Application state is stored in the platform's per-user application-data
-directory. See `docs/application-runtime.md`, `docs/desktop-runtime.md`, and
-`docs/gguf-backend.md` for the relevant boundaries.
+The frontend currently manages model resolution and lifecycle through the Candle CPU composition; it does not generate text yet. Application state is stored in the platform's per-user application-data directory.
+
+Relevant guides:
+
+- [Application runtime](docs/project/application-runtime.md)
+- [Desktop runtime](docs/project/desktop-runtime.md)
+- [Candle backend](docs/project/candle-backend.md)
+- [GGUF backend](docs/project/gguf-backend.md)

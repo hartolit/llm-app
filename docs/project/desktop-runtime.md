@@ -17,7 +17,7 @@ It does not fabricate a chat loop. Context planning, prompt rendering, sampling,
 stateful decode, stop matching, and generation scheduling must be connected as a
 single later phase with allocation and backpressure tests.
 
-See `docs/application-runtime.md` for the complete E1 public boundary.
+See the [application runtime guide](application-runtime.md) for the complete E1 public boundary.
 
 ## Frontend-neutral orchestration
 

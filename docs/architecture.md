@@ -1,90 +1,101 @@
-# Architectural Blueprint: The Modular Philosophy
+# Architecture
 
-**CORE IDEOLOGY: DEFEATING THE MONOLITH**
-This project strictly rejects monolithic structures. We do not build massive, tightly coupled "engine" or "core" crates where logic is tangled. We operate on a highly modular, decoupled architecture. Every distinct feature, system, or domain must exist as its own independent crate within a Cargo workspace.
+This document is the current normative architecture policy. The [documentation map](README.md) defines its authority relative to ADRs, status, component guides, historical plans, and knowledge notes.
 
----
+## Rule classes
 
-## ACTIVE ARCHITECTURE SELECTION
-*Mark the architecture model currently utilized by this project with `[X]`.*
+Every architectural statement should be understood as one of these classes:
 
-- [ ] **MODEL A:** Standard Workspace (Small-to-Medium Projects)
-- [ X ] **MODEL B:** Layered Workspace (Large-Scale / Complex Projects)
+- **Hard invariant** — required for correctness, safety, or a deliberately enforced boundary. A change requires implementation evidence and, when architectural, an ADR.
+- **Current decision** — the selected design for the present product. It may change through an ADR when a real use case provides contrary evidence.
+- **Performance hypothesis** — a claim that must be supported by a named benchmark, allocation test, profile, or generated-code inspection before it becomes a requirement.
+- **Style preference** — a default that improves consistency but may yield to clearer code.
+- **Temporary constraint** — a deliberate limit while the first product slice is being proved.
 
----
+## Hard invariants
 
-### [ ] MODEL A: STANDARD WORKSPACE
-*Optimized for focused applications, single-purpose tools, or tight bare-metal implementations.*
+### Ownership and lifecycle
 
-**1. CRATE ONTOLOGY**
-* **Feature Crates (The Building Blocks):** Isolated, heavily confined modules (e.g., `os-vga`, `game-water`). These must NEVER depend upward on the main engine or horizontally on unrelated feature crates. Design every crate as if it will be published to `crates.io` and used by an entirely different project tomorrow.
-* **Engine/Core Crates (The Glue):** These crates do NOT implement core features. Instead, they consume Feature Crates and provide the orchestration, ECS integration, or state management to link them together cleanly.
-* **App/Runner Crates (The Boundary):** Thin execution vectors (e.g., `kernel-runner`, `server-cli`). They handle initialization, config loading, and environment I/O, then pass control to the Engine.
+- The inference runtime exclusively owns loaded model and sequence values during normal execution. Public handles carry identity, not shared model ownership.
+- Model, sequence, request, cancellation, drain, unload, and shutdown transitions are explicit and bounded where the underlying backend permits bounded progress.
+- Native resources are not destroyed while backend code holds mutable access to them.
+- Commands, event queues, workspaces, and output accumulation use explicit capacities where unbounded growth could violate runtime behavior.
 
----
+### Dependency direction
 
-### [ X ] MODEL B: LAYERED WORKSPACE
-*Optimized for expansive applications requiring heavy infrastructure decoupling, multiple execution environments, and complex external dependencies (e.g., LLM applications, heavy desktop software).*
+- The workspace dependency graph is acyclic.
+- Portable feature contracts do not import engines, applications, vendor runtimes, filesystem/network/database clients, frontend toolkits, or OS transport implementations.
+- Adapters do not import engines or applications.
+- `inference-runtime` does not import `application-runtime` or an application.
+- Application production code enters model lifecycle behavior through `application-runtime`, rather than bypassing it to compose E0 and adapters independently.
 
-**1. CRATE ONTOLOGY**
-* **Feature Crates (Pure Logic & Contracts):** Pure, isolated building blocks and domain types (e.g., `domain-contracts`, `tokenization`, `context-planner`). These strictly define interfaces and mathematical/logical operations. They should ideally be `no_std` and must NEVER depend upward or horizontally.
-* **Adapter Crates (Infrastructure):** Heavy infrastructure implementations. This isolates `std`-dependent boundaries, C-FFI, and third-party vendor wrappers (e.g., `candle-backend`, `gguf-backend`, `redb-storage`) away from pure feature logic. Adapters implement the traits defined in Feature Crates.
-* **Engine Crates (The Orchestrators):** State managers and task coordinators (e.g., `inference-runtime`, `task-orchestrator`). These consume Features and Adapters to wire the application together.
-* **App/Runner Crates (The Boundary):** Thin execution vectors (e.g., `desktop-slint`, `cli-runner`). They handle OS interactions, environment I/O, config loading, and pass control down to the Engines.
+The current validator enforces workspace-local path dependencies only. It does not yet fail closed on unknown paths, distinguish dependency kinds, or enforce external dependency policy; those are Phase 1 work and must not be claimed as current guarantees.
 
----
+### Unsafe code
 
-## 2. UNIVERSAL API BOUNDARIES & COUPLING LAWS
-*(These laws are absolute and apply regardless of the selected architecture model.)*
+Project-authored Rust denies unsafe code. Generated-code or FFI containment exceptions must be narrow, documented, and kept inside the adapter or generated module that requires them. Safe types must prevent native pointers or invalid lifetimes from escaping those boundaries.
 
-* **Explicit Public APIs:** A crate's internals must be heavily encapsulated. Internal logic, state, and helper functions must remain strictly private. Expose only what is strictly necessary through a stable, well-documented API.
-* **Dependency Injection:** Crates should not assume the existence of a global state. Pass necessary contexts, traits, or data down into the crate via its API.
-* **Acyclic Dependencies:** Crates must form a clean, directed acyclic graph (DAG). Circular dependencies or "God objects" that weave crates back together are architectural failures.
+## Current decisions
 
----
+### Physical layout
 
-## 3. STRUCTURAL ANTI-PATTERNS (LESSONS LEARNED)
-* **Micro-Crate Hell:** Do not over-fragment domain logic into infinitesimally small crates (e.g., separating identifiers, metadata, and buffers into individual `Cargo.toml` files). Consolidate core types into cohesive crates (like `domain-contracts`) to prevent verbose import nightmares and API fragmentation.
-* **The Adapter Quarantine:** Heavy ecosystem dependencies and OS-level I/O must remain strictly quarantined inside the Adapters directory. Features must remain pure (and potentially `no_std`). Never bleed infrastructure or vendor-specific code into the logic layer.
-* **Engine Consolidation:** Orchestrators share tight lifetimes and high-frequency state. Splitting them into too many granular crates mathematically increases the risk of circular dependencies. Keep engines consolidated (e.g., 1-3 crates max per domain) to guarantee a clean, acyclic dependency tree.
+The repository uses these categories:
 
----
+```text
+crates/features/    portable contracts and algorithms
+crates/adapters/    infrastructure and vendor implementations
+crates/engines/     stateful orchestration and resource ownership
+crates/apps/        process, event-loop, and presentation boundaries
+```
 
-## 4. PROJECT-SPECIFIC FEATURE TIERS
+Folder names communicate ownership but have no Cargo semantics. Crates move only when ownership, reuse, or dependency evidence justifies the change; path churn is not an architecture improvement by itself. See [ADR-0005](decisions/0005-retain-crate-folders.md).
 
-The current workspace uses two dependency tiers inside the Feature layer:
+### Feature tiers
 
-- **F0 — `domain-contracts`:** The sole shared leaf contract. It owns the common
-  vocabulary that must cross engine/backend boundaries and has no workspace-local
-  dependencies.
-- **F1 — Algorithmic features:** `tokenization`, `context-planner`, `sampling`,
-  and `task-graph`. An F1 crate may depend downward on F0 but may never depend on
-  another F1 crate.
+`domain-contracts` is the current F0 shared foundation. `tokenization`, `context-planner`, `sampling`, and `task-graph` are F1 algorithm crates.
 
-Therefore, `sampling -> domain-contracts` is a downward dependency, while
-`sampling -> tokenization` would be a forbidden horizontal dependency. Folder
-proximity does not define dependency level; the declared tier does.
+The currently enforced production policy allows F1 → F0 and rejects F1 → F1. This is a **temporary constraint**, not a universal Rust principle. It remains in force until the generation slice supplies enough evidence to replace it with an approved acyclic dependency graph. New shared vocabulary must not be pushed into `domain-contracts` merely to evade the policy.
 
-This exception does not authorize arbitrary shared utility crates. A new F0
-crate requires architectural review. Shared identifiers, capacity failures, and
-backend-facing contracts remain consolidated in `domain-contracts` to avoid
-micro-crate fragmentation.
+### Engine tiers
 
-## 5. PROJECT-SPECIFIC ENGINE TIERS
+- E0 `inference-runtime` owns models, sequences, requests, admission, cancellation, draining, and unload.
+- E1 `application-runtime` is the frontend-neutral application façade and current native composition root. It owns artifact resolution, tokenizer validation, persistence, normalized application state/events, and model lifecycle use cases.
+- E1 may depend on E0. E0 may not depend on E1.
 
-The engine layer currently contains two consolidated ownership domains:
+Keeping E1 as the reusable frontend boundary is [ADR-0001](decisions/0001-application-runtime-facade.md). It should not be made generic over every service. Cold, coarse replacement points may use trait objects or closed enums; token-sensitive model execution remains statically dispatched.
 
-- **E0 — `inference-runtime`:** owns loaded model generations, active sequences,
-  admission control, cancellation, draining, and deterministic resource release.
-- **E1 — `application-runtime`:** owns frontend-neutral application use cases:
-  Hub resolution, tokenizer validation, persistence, and commands directed to E0.
+### Frontends and deployment
 
-`application-runtime -> inference-runtime` is the only permitted engine-to-engine
-production edge. The inverse edge is forbidden. This tiering avoids placing Hub,
-storage, or frontend workflow concerns in the inference resource owner while
-keeping the total engine count within the 1–3 crate consolidation rule.
+Slint, a native Tauri host, a CLI, or another native process may call `application-runtime` directly. A browser-only frontend cannot own Candle, llama.cpp, redb, native threads, and filesystem paths; it requires an explicit transport to a native or remote host.
 
-Slint, Tauri, CLI, and other execution vectors depend on E1 instead of directly
-reimplementing adapter composition. A browser-only frontend must cross a
-transport boundary to a native or remote E1 host rather than importing native
-model adapters into WebAssembly.
+The frontend presents state and pulls bounded output. It does not drive one inference command per generated token. Generation scheduling belongs beside model execution as recorded by [ADR-0003](decisions/0003-generation-scheduling-ownership.md).
+
+## Temporary product constraints
+
+Until the first streamed generation slice is complete:
+
+- CPU is the only supported device class;
+- Candle is the composed E1/UI backend;
+- GGUF exists only at the adapter/E0 compatibility boundary;
+- E1 represents one resident model generation;
+- direct completion is the first planned generation mode;
+- general chat templates, remote transport, GPU execution, and broad crate reorganization are deferred.
+
+The backend and prompt sequencing decisions are recorded in [ADR-0002](decisions/0002-candle-cpu-first-vertical-slice.md) and [ADR-0004](decisions/0004-direct-completion-before-chat.md).
+
+## Performance hypotheses and evidence
+
+- Static dispatch is required in measured token/tensor loops where it materially affects code generation. Dynamic dispatch is permitted for cold, coarse operations such as storage, artifact resolution, configuration, and backend selection.
+- Allocation-free behavior may be required for a named project-owned hot path only when a test defines the measured region. It is not inferred from `no_std`, caller-owned output, or adapter boundaries.
+- `#[inline]`, `#[inline(always)]`, `#[cold]`, layout changes, smaller integer types, and custom data layouts require profiling or generated-code evidence when used as optimizations.
+- Component benchmarks establish component behavior only. They do not prove end-to-end latency or throughput.
+
+## Crate and module design preferences
+
+Crates should follow cohesive ownership, independent reuse, dependency direction, and meaningful test boundaries. There is no numerical crate quota. Before extracting a crate, prefer an internal module split when the code shares one lifecycle and has no independent consumer.
+
+Public APIs should expose the minimum stable vocabulary required by callers. Internal helpers use the narrowest practical visibility. Dependency injection is preferred over hidden global state, but type parameters should not spread through public application APIs without a hot-path or reuse reason.
+
+## Shutdown
+
+Callers must use explicit bounded shutdown for workers and model resources. Blocking `Drop` is not the primary shutdown mechanism; a best-effort drop path cannot replace an observable shutdown result. See [ADR-0006](decisions/0006-explicit-bounded-shutdown.md).

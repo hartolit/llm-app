@@ -75,8 +75,8 @@ on `inference-runtime`; the reverse edge is forbidden. This explicit E1 → E0
 edge permits Slint, Tauri, CLI, or another frontend to reuse one application
 workflow without placing vendor concerns inside the inference owner.
 
-Adding further engine crates requires architectural review and must preserve the
-project limit of a small consolidated engine layer.
+Adding an engine crate requires architectural review and evidence of independent
+ownership, lifecycle, or reuse. The project has no numerical crate quota.
 
 ## Layer direction
 
