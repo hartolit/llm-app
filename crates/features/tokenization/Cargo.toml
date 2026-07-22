@@ -8,7 +8,7 @@ description = "Allocation-free tokenization contracts and caller-owned buffers"
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../domain-contracts" }
+domain-contracts.workspace = true
 
 [lints]
 workspace = true

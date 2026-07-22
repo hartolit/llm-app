@@ -9,7 +9,7 @@ publish = false
 build = "build.rs"
 
 [dependencies]
-application-runtime = { path = "../../engines/application-runtime" }
+application-runtime.workspace = true
 slint.workspace = true
 
 [build-dependencies]

@@ -1,3 +1,5 @@
+# HauhauCS/Gemma4-12B-QAT-Uncensored-HauhauCS-Balanced
+
 # llm-app
 
 A layered Rust workspace for local language-model inference, context planning,

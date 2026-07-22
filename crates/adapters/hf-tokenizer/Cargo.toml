@@ -8,8 +8,8 @@ description = "Hugging Face tokenizer adapter for the portable tokenization cont
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../../features/domain-contracts" }
-tokenization = { path = "../../features/tokenization" }
+domain-contracts.workspace = true
+tokenization.workspace = true
 tokenizers = { workspace = true }
 
 [lints]

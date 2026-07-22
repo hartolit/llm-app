@@ -260,13 +260,75 @@ const fn allows(source: Layer, target: Layer) -> bool {
                 | Layer::Adapter
                 | Layer::EngineFoundation
         ),
-        Layer::Application => matches!(
-            target,
-            Layer::FeatureFoundation
-                | Layer::FeatureAlgorithm
-                | Layer::Adapter
-                | Layer::EngineFoundation
-                | Layer::EngineApplication
-        ),
+        Layer::Application => matches!(target, Layer::EngineApplication),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{Layer, allows, classify_manifest};
+
+    #[test]
+    fn manifests_are_classified_into_project_specific_tiers() {
+        let root = Path::new("/workspace");
+        let cases = [
+            ("Cargo.toml", Layer::Root),
+            (
+                "crates/features/domain-contracts/Cargo.toml",
+                Layer::FeatureFoundation,
+            ),
+            (
+                "crates/features/sampling/Cargo.toml",
+                Layer::FeatureAlgorithm,
+            ),
+            ("crates/adapters/candle-backend/Cargo.toml", Layer::Adapter),
+            (
+                "crates/engines/inference-runtime/Cargo.toml",
+                Layer::EngineFoundation,
+            ),
+            (
+                "crates/engines/application-runtime/Cargo.toml",
+                Layer::EngineApplication,
+            ),
+            ("crates/apps/desktop-slint/Cargo.toml", Layer::Application),
+        ];
+
+        for (relative, expected) in cases {
+            assert_eq!(classify_manifest(root, &root.join(relative)), expected);
+        }
+    }
+
+    #[test]
+    fn feature_and_adapter_boundaries_reject_upward_and_horizontal_edges() {
+        assert!(allows(Layer::FeatureAlgorithm, Layer::FeatureFoundation));
+        assert!(!allows(Layer::FeatureAlgorithm, Layer::FeatureAlgorithm));
+        assert!(!allows(Layer::FeatureAlgorithm, Layer::Adapter));
+        assert!(!allows(Layer::FeatureAlgorithm, Layer::EngineFoundation));
+        assert!(!allows(Layer::FeatureAlgorithm, Layer::Application));
+
+        assert!(allows(Layer::Adapter, Layer::FeatureFoundation));
+        assert!(allows(Layer::Adapter, Layer::FeatureAlgorithm));
+        assert!(!allows(Layer::Adapter, Layer::Adapter));
+        assert!(!allows(Layer::Adapter, Layer::EngineFoundation));
+        assert!(!allows(Layer::Adapter, Layer::Application));
+    }
+
+    #[test]
+    fn engine_and_application_edges_follow_the_declared_tiers() {
+        assert!(allows(Layer::EngineFoundation, Layer::FeatureFoundation));
+        assert!(allows(Layer::EngineFoundation, Layer::Adapter));
+        assert!(!allows(Layer::EngineFoundation, Layer::EngineApplication));
+        assert!(!allows(Layer::EngineFoundation, Layer::Application));
+
+        assert!(allows(Layer::EngineApplication, Layer::EngineFoundation));
+        assert!(allows(Layer::EngineApplication, Layer::Adapter));
+        assert!(!allows(Layer::EngineApplication, Layer::EngineApplication));
+        assert!(!allows(Layer::EngineApplication, Layer::Application));
+
+        assert!(allows(Layer::Application, Layer::EngineApplication));
+        assert!(!allows(Layer::Application, Layer::EngineFoundation));
+        assert!(!allows(Layer::Application, Layer::Adapter));
     }
 }

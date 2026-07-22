@@ -49,6 +49,19 @@ default-members = [
 resolver = "3"
 
 [workspace.dependencies]
+application-runtime = { path = "crates/engines/application-runtime" }
+candle-backend = { path = "crates/adapters/candle-backend" }
+context-planner = { path = "crates/features/context-planner" }
+domain-contracts = { path = "crates/features/domain-contracts" }
+gguf-backend = { path = "crates/adapters/gguf-backend" }
+hf-hub-adapter = { path = "crates/adapters/hf-hub" }
+hf-tokenizer = { path = "crates/adapters/hf-tokenizer" }
+host-runtime = { path = "crates/adapters/host-runtime" }
+inference-runtime = { path = "crates/engines/inference-runtime" }
+redb-storage = { path = "crates/adapters/redb-storage" }
+sampling = { path = "crates/features/sampling" }
+task-graph = { path = "crates/features/task-graph" }
+tokenization = { path = "crates/features/tokenization" }
 libm = { version = "0.2", default-features = false }
 candle-core = { version = "0.11.0", default-features = false }
 candle-nn = { version = "0.11.0", default-features = false }
@@ -63,6 +76,7 @@ serde = { version = "1.0", features = ["derive"] }
 redb = { version = "4.1.0", default-features = false }
 slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "compat-1-2"] }
 slint-build = "1.17.1"
+stats_alloc = "0.1.10"
 
 [workspace.package]
 version = "0.1.0"

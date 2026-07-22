@@ -8,7 +8,7 @@ description = "Deterministic allocation-free context budgeting and selection"
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../domain-contracts" }
+domain-contracts.workspace = true
 
 [lints]
 workspace = true

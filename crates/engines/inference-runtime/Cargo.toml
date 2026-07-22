@@ -8,12 +8,12 @@ description = "Exclusive model registry and bounded inference lifecycle engine"
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../../features/domain-contracts" }
-host-runtime = { path = "../../adapters/host-runtime" }
+domain-contracts.workspace = true
+host-runtime.workspace = true
 
 [dev-dependencies]
-candle-backend = { path = "../../adapters/candle-backend" }
-gguf-backend = { path = "../../adapters/gguf-backend" }
+candle-backend.workspace = true
+gguf-backend.workspace = true
 
 [lints]
 workspace = true

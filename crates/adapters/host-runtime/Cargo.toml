@@ -8,7 +8,7 @@ description = "Bounded host threading, channels, and monotonic clock adapter"
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../../features/domain-contracts" }
+domain-contracts.workspace = true
 flume.workspace = true
 
 [lints]

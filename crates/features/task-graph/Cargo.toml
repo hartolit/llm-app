@@ -8,7 +8,7 @@ description = "Allocation-free task graph validation and workflow state transiti
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../domain-contracts" }
+domain-contracts.workspace = true
 
 [lints]
 workspace = true

@@ -8,7 +8,7 @@ description = "Deterministic zero-allocation logit sampling and stop matching"
 publish = false
 
 [dependencies]
-domain-contracts = { path = "../domain-contracts" }
+domain-contracts.workspace = true
 libm.workspace = true
 
 [lints]
