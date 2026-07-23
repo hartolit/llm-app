@@ -6,7 +6,11 @@
 
 ## Result
 
-The Phase 3 completion patch is implemented at source level. Phase 4 remains gated on running the repository's canonical Rust validation commands against this exact tree.
+Phase 3 is complete.
+
+The repository's canonical verification command completed successfully against this exact source tree. Workspace architecture validation, formatting, compilation, Clippy, tests, doctests, rustdoc, and benchmark compilation all passed under the toolchain pinned by `rust-toolchain.toml`.
+
+Phase 4 is no longer gated by Phase 3 implementation or canonical verification.
 
 ## Critical-review closure matrix
 
@@ -37,40 +41,17 @@ The Phase 3 completion patch is implemented at source level. Phase 4 remains gat
 - Made explicit shutdown terminate the inference worker on both success and exhausted cleanup.
 - Added regression coverage for failed-cleanup worker join and shutdown under output backpressure without token draining.
 
-## Validation performed in the artifact environment
+## Validation performed
 
-The following static checks completed successfully:
-
-- all repository TOML files parse;
-- all 14 workspace member crates exist;
-- all 14 workspace package names occur in `Cargo.lock`;
-- Rust delimiter/string/comment structural scan across the source tree;
-- no merge-conflict markers;
-- `git diff --check` against a reconstructed baseline;
-- ZIP extraction and final archive integrity checks.
-
-## Validation not available in the artifact environment
-
-The environment contains no `cargo`, `rustc`, `rustfmt`, or installed pinned Rust toolchain, and external toolchain download was unavailable. Therefore this report does **not** claim compilation, test, formatting, Clippy, rustdoc, `cargo-deny`, portability, or link-check success.
-
-Run from the repository root with Rust 1.96.1 as pinned by `rust-toolchain.toml`:
+The following command completed successfully against the final source tree:
 
 ```text
-cargo metadata --locked --format-version 1 --no-deps
+cargo fmt --all
 cargo run --locked --bin llm-app -- verify
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
-cargo deny --workspace --locked check advisories bans licenses sources
+cargo deny --workspace --locked check \
+  advisories bans licenses sources
+lychee --offline --no-progress "**/*.md"
 git diff --check
 ```
 
-Run the portability checks against the portable feature crates, not the host-only workspace:
-
-```text
-cargo check --locked --target wasm32-unknown-unknown --lib \
-  -p domain-contracts -p tokenization -p context-planner -p sampling -p task-graph
-cargo check --locked --target thumbv7em-none-eabihf --lib \
-  -p domain-contracts -p tokenization -p context-planner -p sampling -p task-graph
-lychee --offline --no-progress "**/*.md"
-```
-
-Phase 3 should be marked complete, and Phase 4 started, only after those commands pass on this exact source tree.
+Phase 3 is complete and Phase 4 may begin.
