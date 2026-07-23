@@ -2,120 +2,83 @@
 
 **Status date:** 2026-07-23
 
-**Source baseline:** uncommitted Phase 3 working tree based on commit `1289f1242fd1bf31ed8d9b235e2bb090218f5666`
+**Source baseline:** uploaded Phase 3 archive, including `Cargo.lock`; repository VCS metadata was not included
 
-**Execution position:** Phase 3 backend-independent generation kernel implemented; Phase 4 real Candle generation has not started
+**Execution position:** Phase 3 completion patch implemented at source level; the canonical locked validation gate must pass before Phase 4 starts
 
 **Canonical plan:** [LLM App Execution Plan](../execution/execution-plan.md)
 
-This is the canonical statement of what the repository supports now. Historical phase numbering in older component guides describes when code was introduced; it is not the active roadmap.
+This document is the canonical statement of what the delivered source tree claims. It deliberately separates implemented source from validation evidence.
 
 ## Supported devices and backends
 
 | Backend | Device | Adapter/E0 boundary | `application-runtime` (E1) | Slint UI |
 |---|---|---:|---:|---:|
-| Candle 0.11 Llama/Safetensors | CPU | Yes | Yes, currently composed | Yes, lifecycle only |
+| Candle 0.11 Llama/Safetensors | CPU | Yes | Yes, lifecycle composition | Yes, lifecycle only |
 | GGUF via llama.cpp | CPU | Yes | No | No |
 | Candle or GGUF | CUDA/Metal/other GPU | No supported product path | No | No |
 
-The repository is CPU-only today.
+The repository is CPU-only today. Real-model prompt-to-token generation remains Phase 4; Phase 3 ordinary generation coverage uses a deterministic fake backend.
 
-The Candle adapter targets unquantized Hugging Face Llama configuration and Safetensors weights. The application runtime resolves Hugging Face artifacts, validates the Hugging Face tokenizer and scalar declaration, persists one logical selection, and loads one Candle model generation on CPU.
+## Phase 3 source implementation
 
-The GGUF adapter supports the backend contracts and compile/test compatibility at the lower inference boundary. It does not yet have the tokenizer, E1 composition, or UI backend selection required for a product path.
+The source tree now contains the integrated backend-independent generation kernel:
+
+- worker-owned prompt prefill, in-E0 sampling, incremental decode, bounded round-robin scheduling, cancellation, EOS, token-limit, and token stop-sequence handling;
+- pull-oriented preallocated token/state output with nonblocking backpressure and ordered terminal records;
+- explicit `GenerationOutputCapacityPolicy` admission against the hosted accumulator;
+- preflight of prompt batch length, total sequence length, exact full-vocabulary logits capacity, model lifecycle/degraded state, identities, backend sequence memory, and generation host workspace memory before native sequence publication;
+- generation workspace accounting for logits, sampling indices, repetition epochs, prompt/history/generated token storage, EOS storage, and stop-pattern storage;
+- workspace accounting retained until terminal output release, even when backend sequence cleanup completed earlier;
+- one cleanup state machine for admission rollback, completion, cancellation, backend/sampling failure, unload maintenance, drain escalation, and shutdown;
+- allocation-free primary-plus-cleanup failure classification;
+- quarantined model and sequence ownership with truthful memory/sequence accounting;
+- deterministic total-attempt cleanup policy, one retry opportunity per maintenance loop, explicit retry/exhaustion state, and no retry after success or exhaustion;
+- failed normal unload and shutdown unload routed through the same model quarantine policy;
+- degraded-model admission rejection while a sequence remains quarantined;
+- terminal explicit-shutdown and endpoint-disconnection policies that preserve unresolved native ownership rather than invoking an unverified implicit drop;
+- shutdown termination independent of frontend token-output draining, with retained generation workspace accounting released before worker exit;
+- deterministic fake-backend counters for loads, unload attempts, sequence creation/destruction, successful destruction, prefill/decode calls, sampling opportunities, active native resources, and retained simulated memory;
+- fault-injection coverage added for cancellation before prefill, scheduled drain timeout, exact admission failures, repeated cleanup failure/exhaustion, model cleanup, shutdown cleanup, healthy-model isolation, later cleanup success, and exact single release.
+
+`Cargo.lock` is present in the delivered tree.
 
 ## Integration depth
 
 | Capability | E0 inference runtime | E1 application runtime | Slint UI |
 |---|---:|---:|---:|
-| Model load, generation-safe handle, drain, cancellation, unload | Yes | Yes for Candle | Yes for Candle |
-| Hugging Face resolve/tokenizer validation/persistence | N/A | Yes | Yes |
+| Model load, generation-safe handle, drain, cancellation, unload | Yes | Yes for Candle lifecycle | Yes for Candle lifecycle |
 | Backend prefill and decode primitives | Yes | Not exposed as generation | No |
-| Backend-independent generation scheduler | Yes, deterministic fake backend | Not exposed | No |
-| Sampling algorithm | Integrated inside E0 generation | Not exposed | No |
-| Context planning | Separate feature crate | Not integrated | No |
-| Direct-completion prompt-to-stream loop | No | No | No |
+| Backend-independent generation scheduler | Implemented with deterministic fake backend | Not exposed | No |
+| Sampling algorithm | Integrated inside E0 | Not exposed | No |
+| Bounded streamed token output | Pull-oriented token/state batches | No | No |
+| Direct-completion real-model loop | Phase 4 | No | No |
+| Tokenization and decoded text streaming | Separate foundations only | Not integrated | No |
 | General chat templates/history | No | No | No |
-| Bounded streamed token output | Yes, pull-oriented token/state batches | No | No |
-| Bounded streamed text output | Transport primitive only | No | No |
-| Corrective workflow graph | N/A | Yes, separately composable | No product surface |
 
-E0 now performs already-tokenized prompt → prefill → sample → incremental decode → bounded token streaming with deterministic fake models. No current user-facing path supplies tokenization, decoded text, context planning, or generation controls. Direct completion through Candle is the next planned vertical slice; general chat support follows later.
+## Validation status for this delivered patch
 
-## Implemented foundations
+The canonical validation commands were **not executed in the artifact-editing environment** because it contains no Rust toolchain (`cargo`, `rustc`, or `rustfmt`) and external network access was unavailable. Therefore this document does not claim a passing test count, warning-free Clippy, rustdoc success, formatting success, or a completed Phase 3 gate for this exact archive.
 
-- Portable `domain-contracts`, tokenization, context-planning, sampling, and task-graph crates.
-- Candle CPU and GGUF CPU adapters with backend contract tests.
-- Exclusive-owner inference runtime with bounded hosted transport, lifecycle state, memory admission, cancellation, draining, and unload.
-- Prepare/validate/commit model-load and request-start transactions with explicit native rollback and deterministic fault-injection coverage.
-- Quarantined model/sequence ownership after failed cleanup, structured primary-plus-cleanup failure reports, retained capacity/memory accounting, degraded-model admission rejection, and bounded maintenance retry.
-- Worker-owned prefill/decode/sample scheduling with preallocated request workspaces, bounded fairness, cancellation boundaries, EOS/token-limit/token-stop handling, and pull-oriented token backpressure.
-- Deterministic fake-backend generation tests requiring no model download, covering greedy and seeded sampling, stop conditions, cancellation, backend failure, cleanup failure/retry, and duplicate-cleanup counters.
-- Frontend-neutral application façade for Hugging Face resolution, tokenizer validation, redb persistence, Candle model lifecycle, normalized events, and corrective workflows.
-- Checked bounded shutdown deadlines, explicit Slint close-path shutdown, and deterministic disconnection, timeout, join-failure, cancellation, and unload-failure tests.
-- Thin Slint lifecycle frontend.
-- Package-local correctness, allocation, compatibility, and workflow tests plus one Criterion sampling benchmark.
-- Typed, fail-closed architecture and external-dependency validation with full layer-matrix and real-workspace integration coverage.
-- Linux CI definitions for locked Rust checks, dependency/license/advisory policy, Markdown links, and named portability targets.
-
-Component details are indexed by the [documentation map](../README.md).
-
-## Reproducible validation evidence
-
-Local validation ran on 2026-07-23 from the uncommitted Phase 3 working tree based on commit `1289f1242fd1bf31ed8d9b235e2bb090218f5666`. A remote CI run URL cannot exist until the change is pushed; `.github/workflows/quality.yml` is configured to run on every push and pull request.
-
-Toolchain and installed targets:
+Run the following from the repository root with the pinned toolchain in `rust-toolchain.toml`:
 
 ```text
-rustc 1.96.1 (31fca3adb 2026-06-26)
-cargo 1.96.1 (356927216 2026-06-26)
-x86_64-unknown-linux-gnu
-wasm32-unknown-unknown
-thumbv7em-none-eabihf
-```
-
-The complete local runner passed:
-
-```text
+cargo metadata --locked --format-version 1 --no-deps
 cargo run --locked --bin llm-app -- verify
-```
-
-It ran typed architecture/dependency validation, formatting, `cargo check --workspace --all-targets --locked`, ordinary `cargo test --workspace --locked`, Clippy with `-D warnings`, API documentation, and `cargo bench --workspace --no-run --locked`. Ordinary tests did not select the Criterion benchmark target; benchmark targets compiled separately.
-
-Additional CI-equivalent checks passed:
-
-```text
-RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
-cargo check --locked --target wasm32-unknown-unknown --lib -p domain-contracts -p tokenization -p context-planner -p sampling -p task-graph
-cargo check --locked --target thumbv7em-none-eabihf --lib -p domain-contracts -p tokenization -p context-planner -p sampling -p task-graph
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 cargo deny --workspace --locked check advisories bans licenses sources
-lychee --config lychee.toml --offline '**/*.md'
+git diff --check
 ```
 
-Results:
-
-- 114 ordinary tests passed; zero failed;
-- Clippy and rustdoc completed with zero warnings under `-D warnings`;
-- all workspace benchmark targets compiled;
-- both named non-host library target checks passed for all five portable feature crates;
-- the full workspace graph passed `cargo-deny 0.20.2` advisories, dependency bans, licenses, and sources with five documented transitive advisory exceptions;
-- Lychee 0.24.2 checked 72 Markdown links: 62 valid, 10 external/offline exclusions, zero errors;
-- `cargo tree -d --locked` remains an audit report: metadata contains 57 duplicated package names spanning 120 package-version entries; no blanket deduplication is required;
-- the last recorded Phase 1 `desktop-slint` release binary size was 46,540,808 bytes for `x86_64-unknown-linux-gnu` using the default release profile; Phase 3 did not rerun that size measurement.
-
-No product binary was launched and no real external model was exercised by this quality-gate validation.
+Also run the configured portability and Markdown-link checks described by the execution plan and CI workflow. Phase 4 must remain gated until these commands pass on the exact delivered tree.
 
 ## Known limitations
 
-- The CI workflow is present, but this uncommitted working tree has no remote CI run URL yet; required-branch protection must be configured in the repository host after the workflow is pushed.
-- CI currently names Ubuntu 24.04 / `x86_64-unknown-linux-gnu` as the host platform. Windows and macOS jobs remain deferred until native toolchains are documented.
-- Scheduled external-link checks depend on third-party site availability; pull-request link checks intentionally validate repository-local links offline.
-- Explicit bounded shutdown remains a caller obligation for any future non-Slint frontend; blocking `Drop` is intentionally not a fallback.
-- Phase 3 generation begins from caller-supplied token IDs and emits token IDs; tokenizer ownership, incremental text decoding, E1 commands, and frontend pulls remain Phase 5/6 work.
-- Ordinary generation tests use a deterministic fake backend. Real Candle prompt-to-token generation remains Phase 4 and is not claimed here.
-- E1 exposes configuration capacity below it but represents only one loaded model generation.
-- Candle’s upstream cache and GGUF’s native execution do not support a repository-wide allocation-free backend claim.
-- Real-model smoke testing is target-machine work and is not part of the baseline command above.
+- Phase 3 starts from caller-supplied token IDs and emits token IDs; tokenizer ownership, incremental text decoding, E1 generation commands, and frontend pulls remain later work.
+- Real Candle/GGUF prompt-to-token generation is not claimed by this phase.
+- The deterministic cleanup policy uses a total-attempt limit, not wall-clock retry backoff. One non-exhausted cleanup is attempted per worker maintenance loop.
+- Exhausted resources remain quarantined and accounted until process termination or explicit future policy intervention; they do not re-enter normal registries.
+- On endpoint disconnection, unresolved native resources are intentionally retained rather than implicitly dropped after failed explicit cleanup.
 - GPU execution, remote/browser transport, general chat, GGUF UI selection, and multi-model E1 state are unsupported.
 
 ## Historical implementation record

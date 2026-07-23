@@ -8,7 +8,7 @@ use domain_contracts::{
     RequestId, SequenceConfiguration, SequenceId, TokenId, UnloadPolicy,
 };
 
-use crate::{GenerationAdmission, GenerationRequest, RuntimeError};
+use crate::{CleanupRetryState, GenerationAdmission, GenerationRequest, RuntimeError};
 
 /// Caller-assigned command correlation value.
 #[repr(transparent)]
@@ -102,10 +102,22 @@ pub struct RuntimeSnapshot {
     pub active_requests: u32,
     /// Aggregate reserved resident footprint, including quarantined resources.
     pub reserved_footprint: MemoryFootprint,
+    /// Generation tasks retaining host workspaces until terminal output is released.
+    pub generation_workspaces: u32,
+    /// Host workspace bytes retained by active or terminal generation tasks.
+    pub reserved_generation_workspace: MemoryFootprint,
     /// Loaded models retained only for pending cleanup.
     pub pending_cleanup_models: u32,
     /// Sequences retained only for pending cleanup.
     pub pending_cleanup_sequences: u32,
+    /// Pending model cleanups whose automatic retry budget is exhausted.
+    pub exhausted_cleanup_models: u32,
+    /// Pending sequence cleanups whose automatic retry budget is exhausted.
+    pub exhausted_cleanup_sequences: u32,
+    /// Most recent cleanup retry state observed by maintenance.
+    pub last_cleanup: Option<CleanupRetryState>,
+    /// Most recent unexpected maintenance invariant failure.
+    pub maintenance_error: Option<RuntimeError>,
     /// Whether shutdown rejects new work.
     pub shutting_down: bool,
 }
@@ -125,6 +137,8 @@ pub struct ModelSnapshot {
     pub active_requests: u32,
     /// Number of quarantined sequences awaiting explicit destruction.
     pub pending_cleanup_sequences: u32,
+    /// Number of sequence cleanups whose automatic retry budget is exhausted.
+    pub exhausted_cleanup_sequences: u32,
     /// Whether cleanup failure prevents new request admission.
     pub degraded: bool,
 }

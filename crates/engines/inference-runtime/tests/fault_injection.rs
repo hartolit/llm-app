@@ -14,7 +14,10 @@ use domain_contracts::{
     ScalarType, SequenceConfiguration, SequenceError, SequenceId, SequencePlan, SequenceState,
     SynchronizationError, UnloadPolicy,
 };
-use inference_runtime::{InferenceRuntime, RuntimeError, RuntimeLimits};
+use inference_runtime::{
+    CleanupPoll, CleanupResource, CleanupRetryPolicy, FailureClass, InferenceRuntime, RuntimeError,
+    RuntimeLimits, RuntimeOperation,
+};
 
 const BACKEND_ID: BackendId = BackendId::new(92);
 
@@ -387,6 +390,155 @@ fn occupied_request_and_sequence_indexes_fail_before_native_creation() -> TestRe
     Ok(())
 }
 
+#[test]
+fn repeated_sequence_cleanup_failure_exhausts_without_releasing_accounting() -> TestResult {
+    let counts = Rc::new(CleanupCounts::default());
+    let mut runtime =
+        runtime_with_cleanup_attempts(Faults::FAIL_SEQUENCE_DESTRUCTION, Rc::clone(&counts), 3);
+    let loaded = load(&mut runtime).map_err(debug_error)?;
+    start(&mut runtime, loaded.handle, 10, 100).map_err(debug_error)?;
+
+    let initial = runtime.cancel_request(RequestId::new(10), CancellationReason::UserRequested);
+    assert!(matches!(
+        initial,
+        Err(RuntimeError::CleanupFailed(report))
+            if report.primary_failure == FailureClass::Cancellation
+                && report.cleanup_failure == FailureClass::Sequence
+    ));
+    assert_eq!(counts.sequence_destructions.get(), 1);
+    assert_eq!(
+        start(&mut runtime, loaded.handle, 11, 101),
+        Err(RuntimeError::ModelDegraded(loaded.handle.id))
+    );
+    assert_eq!(counts.sequence_creations.get(), 1);
+
+    assert!(matches!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        CleanupPoll::RetryFailed(state)
+            if state.attempts == 2 && !state.exhausted()
+    ));
+    let exhausted = runtime.poll_cleanup().map_err(debug_error)?;
+    assert!(matches!(
+        exhausted,
+        CleanupPoll::Exhausted(state)
+            if state.attempts == 3
+                && state.exhausted()
+                && matches!(
+                    state.resource,
+                    CleanupResource::Sequence {
+                        model_id,
+                        request_id,
+                        sequence_id,
+                    } if model_id == loaded.handle.id
+                        && request_id == RequestId::new(10)
+                        && sequence_id == SequenceId::new(100)
+                )
+    ));
+    assert_eq!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        CleanupPoll::Idle
+    );
+    assert_eq!(counts.sequence_destructions.get(), 3);
+
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.pending_cleanup_sequences, 1);
+    assert_eq!(snapshot.exhausted_cleanup_sequences, 1);
+    assert_eq!(snapshot.reserved_footprint, checked_total_footprint());
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(RuntimeError::CleanupRetryExhausted(state))
+            if state.attempts == 3 && state.exhausted()
+    ));
+    assert_eq!(counts.sequence_destructions.get(), 3);
+    Ok(())
+}
+
+#[test]
+fn normal_model_unload_failure_uses_the_bounded_cleanup_state_machine() -> TestResult {
+    let counts = Rc::new(CleanupCounts::default());
+    let mut runtime =
+        runtime_with_cleanup_attempts(Faults::FAIL_MODEL_CLEANUP, Rc::clone(&counts), 3);
+    let loaded = load(&mut runtime).map_err(debug_error)?;
+
+    let initial = runtime.unload_model(
+        loaded.handle,
+        UnloadPolicy::RejectIfBusy,
+        MonotonicMillis::new(0),
+    );
+    assert!(matches!(
+        initial,
+        Err(RuntimeError::CleanupFailed(report))
+            if report.primary_operation == RuntimeOperation::ModelUnload
+                && report.primary_failure == FailureClass::Completion
+                && report.cleanup_failure == FailureClass::Synchronization
+    ));
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.loaded_models, 0);
+    assert_eq!(snapshot.pending_cleanup_models, 1);
+    assert_eq!(snapshot.reserved_footprint, model_footprint());
+
+    assert!(matches!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        CleanupPoll::RetryFailed(state) if state.attempts == 2
+    ));
+    assert!(matches!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        CleanupPoll::Exhausted(state)
+            if state.attempts == 3
+                && matches!(
+                    state.resource,
+                    CleanupResource::Model { model_id } if model_id == loaded.handle.id
+                )
+    ));
+    assert_eq!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        CleanupPoll::Idle
+    );
+    assert_eq!(counts.model_cleanups.get(), 3);
+
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.pending_cleanup_models, 1);
+    assert_eq!(snapshot.exhausted_cleanup_models, 1);
+    assert!(matches!(
+        runtime.unload_model(
+            loaded.handle,
+            UnloadPolicy::RejectIfBusy,
+            MonotonicMillis::new(1),
+        ),
+        Err(RuntimeError::CleanupRetryExhausted(state))
+            if state.attempts == 3 && state.exhausted()
+    ));
+    Ok(())
+}
+
+#[test]
+fn shutdown_reports_model_cleanup_exhaustion_with_shutdown_as_primary() -> TestResult {
+    let counts = Rc::new(CleanupCounts::default());
+    let mut runtime =
+        runtime_with_cleanup_attempts(Faults::FAIL_MODEL_CLEANUP, Rc::clone(&counts), 3);
+    let loaded = load(&mut runtime).map_err(debug_error)?;
+
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(RuntimeError::CleanupRetryExhausted(state))
+            if state.attempts == 3
+                && state.failure.primary_operation == RuntimeOperation::Shutdown
+                && state.failure.primary_failure == FailureClass::Shutdown
+                && matches!(
+                    state.resource,
+                    CleanupResource::Model { model_id } if model_id == loaded.handle.id
+                )
+    ));
+    assert_eq!(counts.model_cleanups.get(), 3);
+    let snapshot = runtime.snapshot();
+    assert!(snapshot.shutting_down);
+    assert_eq!(snapshot.pending_cleanup_models, 1);
+    assert_eq!(snapshot.exhausted_cleanup_models, 1);
+    assert_eq!(snapshot.reserved_footprint, model_footprint());
+    Ok(())
+}
+
 fn assert_sequence_contract_rollback(faults: Faults) -> TestResult {
     let counts = Rc::new(CleanupCounts::default());
     let mut runtime = runtime(faults, Rc::clone(&counts));
@@ -403,6 +555,15 @@ fn assert_sequence_contract_rollback(faults: Faults) -> TestResult {
 }
 
 fn runtime(faults: Faults, counts: Rc<CleanupCounts>) -> InferenceRuntime<FaultLoader> {
+    runtime_with_cleanup_attempts(faults, counts, 3)
+}
+
+fn runtime_with_cleanup_attempts(
+    faults: Faults,
+    counts: Rc<CleanupCounts>,
+    maximum_attempts: u32,
+) -> InferenceRuntime<FaultLoader> {
+    let maximum_attempts = NonZeroU32::new(maximum_attempts).unwrap_or(NonZeroU32::MIN);
     InferenceRuntime::new(
         FaultLoader { faults, counts },
         RuntimeLimits::new(
@@ -412,7 +573,8 @@ fn runtime(faults: Faults, counts: Rc<CleanupCounts>) -> InferenceRuntime<FaultL
                 host_bytes: 1_024,
                 device_bytes: 0,
             },
-        ),
+        )
+        .with_cleanup_retry_policy(CleanupRetryPolicy::new(maximum_attempts)),
     )
 }
 
@@ -448,6 +610,15 @@ fn assert_empty(runtime: &InferenceRuntime<FaultLoader>) {
     let snapshot = runtime.snapshot();
     assert_eq!(snapshot.loaded_models, 0);
     assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.pending_cleanup_models, 0);
+    assert_eq!(snapshot.pending_cleanup_sequences, 0);
+    assert_eq!(snapshot.exhausted_cleanup_models, 0);
+    assert_eq!(snapshot.exhausted_cleanup_sequences, 0);
+    assert_eq!(snapshot.generation_workspaces, 0);
+    assert_eq!(
+        snapshot.reserved_generation_workspace,
+        MemoryFootprint::default()
+    );
     assert_eq!(snapshot.reserved_footprint, MemoryFootprint::default());
     assert!(runtime.model_snapshots().is_empty());
 }
@@ -456,6 +627,15 @@ fn assert_only_model_reserved(runtime: &InferenceRuntime<FaultLoader>) {
     let snapshot = runtime.snapshot();
     assert_eq!(snapshot.loaded_models, 1);
     assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.pending_cleanup_models, 0);
+    assert_eq!(snapshot.pending_cleanup_sequences, 0);
+    assert_eq!(snapshot.exhausted_cleanup_models, 0);
+    assert_eq!(snapshot.exhausted_cleanup_sequences, 0);
+    assert_eq!(snapshot.generation_workspaces, 0);
+    assert_eq!(
+        snapshot.reserved_generation_workspace,
+        MemoryFootprint::default()
+    );
     assert_eq!(snapshot.reserved_footprint, model_footprint());
     let models = runtime.model_snapshots();
     assert_eq!(models.len(), 1);

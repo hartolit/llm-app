@@ -18,7 +18,8 @@ Hosted worker
 │   │       └── quarantined sequences
 │   ├── quarantined post-load models
 │   ├── active and pending-cleanup identity indexes
-│   └── aggregate normal + quarantined memory accounting
+│   ├── aggregate normal + quarantined memory accounting
+│   └── generation-workspace accounting retained through output release
 ├── fair generation scheduler
 └── nonblocking token-output producer
 ```
@@ -26,9 +27,10 @@ Hosted worker
 Models and sequences are never placed in `Arc` or borrowed across the command
 boundary. Public clients retain only typed identifiers and generation-safe model
 handles. A resource remains counted until its explicit backend cleanup succeeds.
-`RuntimeSnapshot` distinguishes active requests, pending model cleanup, pending
-sequence cleanup, and total reserved memory. Per-model snapshots expose degraded
-state and pending sequence counts.
+`RuntimeSnapshot` distinguishes active requests, retained generation workspaces,
+pending model cleanup, pending sequence cleanup, exhausted cleanup, and total
+reserved memory. Per-model snapshots expose degraded state and pending sequence
+counts.
 
 ## Transaction and cleanup semantics
 
@@ -47,6 +49,10 @@ Cleanup failure does not imply release:
 - quarantined bytes and sequence slots remain admitted against hard limits;
 - an affected model is degraded and rejects new requests;
 - `poll_cleanup` attempts at most one retained operation per call;
+- the initial failure counts as attempt one and the configurable total-attempt
+  limit defaults to three;
+- exhausted resources are skipped by later automatic maintenance and remain
+  quarantined and accounted;
 - successful retry releases identity, capacity, and memory exactly once.
 
 `CleanupFailureReport` is allocation-free and preserves the primary operation and
@@ -68,7 +74,8 @@ must leave the model valid after failure. The runtime never treats unverified
 - sequence capacity and maximum generated tokens;
 - sampling configuration and seed;
 - EOS tokens and owned token stop patterns;
-- scheduler quantum.
+- scheduler quantum;
+- minimum token and record capacity required from the shared pull accumulator.
 
 It does not carry tokenizer objects, decoded text, paths, display strings, frontend
 DTOs, or UI state. Before backend sequence creation, E0 validates prompt and total
@@ -78,10 +85,16 @@ sequence length, model state, identities, and sampling configuration, then reser
 - sampling indices and repetition epochs;
 - prompt/repetition history;
 - generated-token history;
+- caller-owned prompt and EOS token storage;
+- stop-pattern descriptors and token storage;
 - terminal and backpressure state.
 
 The backend still prepares its sequence-owned prefill/decode workspace through its
 normal `SequencePlan`. No vector resize occurs in the scheduler decode loop.
+Workspace payload bytes remain in aggregate admission accounting until the
+`Released` record has been published and the scheduler drops the terminal task.
+This prevents output backpressure from making retained host allocations appear
+available prematurely.
 
 ## Scheduler lifecycle and fairness
 
@@ -120,7 +133,8 @@ range or one `GenerationOutputState`:
 
 - `Yielded(OutputBackpressure)`;
 - `Terminal(original outcome)`;
-- `CleanupPending { original outcome, failure report }`;
+- `CleanupPending { original outcome, failure report, retry state }`;
+- `CleanupExhausted { original outcome, failure report, retry state }`;
 - `Released(original outcome)`.
 
 When token or record capacity is full, the sampled token remains request-owned,
@@ -140,9 +154,20 @@ and failures.
 Immediate model unload marks scheduled requests with `ModelUnload`; drain timeout
 maintenance marks them with `DrainTimeout`. The runtime may have already destroyed
 the sequence at that safe boundary, but the scheduler still publishes the stable
-cancellation outcome. Runtime shutdown marks scheduled work with `RuntimeShutdown`
-and performs explicit sequence/model cleanup; the worker remains alive long enough
-to publish retained terminal output when downstream capacity is available.
+cancellation outcome during normal operation.
+
+Explicit runtime shutdown is a terminal worker transition. It performs bounded
+sequence and model cleanup, releases retained generation-workspace accounting, and
+discards unpublished scheduler records rather than waiting for downstream token
+capacity. Shutdown therefore cannot depend on the UI continuing to drain output.
+The worker sends exactly one shutdown result and terminates after that event is
+delivered.
+
+Shutdown consumes the remaining finite retry budget. If ownership still remains,
+it returns `CleanupRetryExhausted` and does not report successful shutdown. Failed
+explicit cleanup preserves the unresolved runtime allocation rather than falling
+back to an unverified implicit backend drop. The same preservation rule applies
+when client endpoints disconnect before cleanup can complete.
 
 ## Scope after Phase 3
 

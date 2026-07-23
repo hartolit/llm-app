@@ -106,6 +106,8 @@ impl<'a, S: Copy> TokenOutputBatch<'a, S> {
 #[derive(Clone)]
 pub struct TokenOutputProducer<S: Copy> {
     shared: Arc<Mutex<TokenOutputState<S>>>,
+    token_capacity: usize,
+    record_capacity: usize,
 }
 
 /// Application-side handle that drains accumulated token output.
@@ -154,12 +156,20 @@ pub fn token_output_accumulator<S: Copy>(
     Ok((
         TokenOutputProducer {
             shared: Arc::clone(&shared),
+            token_capacity: token_capacity.get(),
+            record_capacity: record_capacity.get(),
         },
         TokenOutputConsumer { shared },
     ))
 }
 
 impl<S: Copy> TokenOutputProducer<S> {
+    /// Returns the fixed token and record capacities reserved during initialization.
+    #[must_use]
+    pub const fn capacities(&self) -> (usize, usize) {
+        (self.token_capacity, self.record_capacity)
+    }
+
     /// Appends one token and its request-scoped range record without blocking.
     ///
     /// # Errors

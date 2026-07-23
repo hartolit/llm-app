@@ -96,6 +96,59 @@ impl CleanupFailureReport {
     }
 }
 
+/// Runtime-owned resource retained after explicit cleanup failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupResource {
+    /// One loaded model retained only for unload retry.
+    Model {
+        /// Logical model identity.
+        model_id: ModelId,
+    },
+    /// One backend sequence retained only for destruction retry.
+    Sequence {
+        /// Logical model identity that owns the sequence.
+        model_id: ModelId,
+        /// Request identity formerly associated with the sequence.
+        request_id: RequestId,
+        /// Backend sequence identity.
+        sequence_id: domain_contracts::SequenceId,
+    },
+}
+
+/// Observable retry state for one retained cleanup resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanupRetryState {
+    /// Retained resource identity.
+    pub resource: CleanupResource,
+    /// Primary and cleanup failure classifications.
+    pub failure: CleanupFailureReport,
+    /// Total cleanup attempts already performed, including the initial failure.
+    pub attempts: u32,
+    /// Maximum total attempts permitted by policy.
+    pub maximum_attempts: u32,
+}
+
+impl CleanupRetryState {
+    /// Returns whether policy forbids another automatic retry.
+    #[must_use]
+    pub const fn exhausted(self) -> bool {
+        self.attempts >= self.maximum_attempts
+    }
+}
+
+/// Result of one bounded cleanup-maintenance opportunity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanupPoll {
+    /// No retryable retained resource was available.
+    Idle,
+    /// One retained resource was released successfully.
+    Released(CleanupRetryState),
+    /// One retry failed but at least one policy attempt remains.
+    RetryFailed(CleanupRetryState),
+    /// One retry failed and exhausted the total-attempt policy.
+    Exhausted(CleanupRetryState),
+}
+
 /// Stable sampling failure category exposed by the runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -199,6 +252,8 @@ pub enum RuntimeError {
     Sampling(SamplingFailure),
     /// Cleanup failed after an independently important primary outcome.
     CleanupFailed(CleanupFailureReport),
+    /// Automatic cleanup retries are exhausted while ownership remains retained.
+    CleanupRetryExhausted(CleanupRetryState),
 }
 
 impl RuntimeError {
@@ -218,6 +273,7 @@ impl RuntimeError {
             Self::ShuttingDown => FailureClass::Shutdown,
             Self::BackendContractViolation => FailureClass::BackendContract,
             Self::CleanupFailed(report) => report.primary_failure,
+            Self::CleanupRetryExhausted(state) => state.failure.primary_failure,
             Self::ModelAlreadyLoaded(_)
             | Self::ModelNotLoaded(_)
             | Self::StaleModelHandle { .. }

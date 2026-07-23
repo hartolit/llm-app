@@ -111,6 +111,12 @@ struct PendingUnload {
     cancelled_requests: u32,
 }
 
+#[derive(Clone, Copy)]
+enum WorkerStop {
+    DropRuntime,
+    PreserveRuntime,
+}
+
 /// Join handle for the exclusively owning runtime worker.
 pub struct RuntimeThread {
     thread: HostThread<()>,
@@ -205,7 +211,8 @@ where
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the worker loop keeps control, generation, maintenance, and publication ordering explicit"
+    reason = "the worker loop keeps control, generation, maintenance, and publication ordering \
+              explicit"
 )]
 fn run_worker<L>(
     mut runtime: InferenceRuntime<L>,
@@ -221,12 +228,14 @@ fn run_worker<L>(
     let mut scheduler = GenerationScheduler::new();
     let mut pending_event = None;
     let mut queued_events = VecDeque::with_capacity(event_backlog_capacity);
-    let mut stop_after_event = false;
+    let mut stop_after_event = None;
     let mut pending_unloads = BTreeMap::<ModelId, PendingUnload>::new();
     let mut maintenance_events = BTreeMap::<ModelId, RuntimeEvent>::new();
 
     loop {
-        let _cleanup_result = runtime.poll_cleanup();
+        if let Err(error) = runtime.poll_cleanup() {
+            runtime.record_maintenance_error(error);
+        }
         if let Some((model_id, event)) =
             maintenance_event(&mut runtime, clock.now(), &mut pending_unloads)
         {
@@ -255,68 +264,45 @@ fn run_worker<L>(
                 .or_else(|| maintenance_events.pop_first().map(|(_, event)| event));
         }
 
-        if stop_after_event
-            && scheduler.is_empty()
+        if let Some(stop) = stop_after_event
             && pending_event.is_none()
             && queued_events.is_empty()
         {
-            break;
+            finish_worker(runtime, stop);
+            return;
         }
 
         if let Some(event) = pending_event.take() {
             match events.try_send(event) {
                 Ok(()) => {
-                    if stop_after_event && scheduler.is_empty() {
-                        break;
+                    if let Some(stop) = stop_after_event {
+                        finish_worker(runtime, stop);
+                        return;
                     }
                 }
                 Err(TrySendError::Full(event)) => pending_event = Some(event),
                 Err(TrySendError::Disconnected(_)) => {
-                    let _shutdown_result = runtime.shutdown();
-                    break;
+                    shutdown_after_disconnect(runtime);
+                    return;
                 }
             }
         }
 
-        if stop_after_event && scheduler.is_empty() {
+        if stop_after_event.is_some() {
             std::thread::sleep(poll_interval);
             continue;
         }
 
         let mut handled_command = false;
-        let can_accept_command = queued_events.len() < event_backlog_capacity;
-        match can_accept_command.then(|| commands.try_receive()) {
-            None | Some(Err(TryReceiveError::Empty)) => {}
-            Some(Ok(command)) => {
-                handled_command = true;
-                let unload_identity = unload_command_identity(&command);
-                let (event, should_stop) = dispatch(
-                    &mut runtime,
-                    &mut scheduler,
-                    token_output,
-                    command,
-                    clock.now(),
-                );
-                remember_pending_unload(unload_identity, &event, &runtime, &mut pending_unloads);
-                if pending_event.is_none() {
-                    pending_event = Some(event);
-                } else {
-                    queued_events.push_back(event);
-                }
-                stop_after_event = should_stop;
-            }
-            Some(Err(TryReceiveError::Disconnected)) => {
-                let _shutdown_result = runtime.shutdown();
+        for _ in 0..8 {
+            if queued_events.len() >= event_backlog_capacity {
                 break;
             }
-        }
-
-        let advance = scheduler.advance(&mut runtime, token_output);
-        if !handled_command && !advance.progressed && queued_events.len() < event_backlog_capacity {
-            match commands.receive_timeout(poll_interval) {
+            match commands.try_receive() {
                 Ok(command) => {
+                    handled_command = true;
                     let unload_identity = unload_command_identity(&command);
-                    let (event, should_stop) = dispatch(
+                    let (event, stop) = dispatch(
                         &mut runtime,
                         &mut scheduler,
                         token_output,
@@ -329,20 +315,86 @@ fn run_worker<L>(
                         &runtime,
                         &mut pending_unloads,
                     );
+                    if let Some(stop) = stop {
+                        pending_event = Some(event);
+                        queued_events.clear();
+                        maintenance_events.clear();
+                        pending_unloads.clear();
+                        stop_after_event = Some(stop);
+                        break;
+                    }
                     if pending_event.is_none() {
                         pending_event = Some(event);
                     } else {
                         queued_events.push_back(event);
                     }
-                    stop_after_event = should_stop;
                 }
-                Err(ReceiveTimeoutError::Timeout) => {}
-                Err(ReceiveTimeoutError::Disconnected) => {
-                    let _shutdown_result = runtime.shutdown();
-                    break;
+                Err(TryReceiveError::Empty) => break,
+                Err(TryReceiveError::Disconnected) => {
+                    shutdown_after_disconnect(runtime);
+                    return;
                 }
             }
         }
+
+        let advance = scheduler.advance(&mut runtime, token_output);
+        if !handled_command && !advance.progressed && queued_events.len() < event_backlog_capacity {
+            match commands.receive_timeout(poll_interval) {
+                Ok(command) => {
+                    let unload_identity = unload_command_identity(&command);
+                    let (event, stop) = dispatch(
+                        &mut runtime,
+                        &mut scheduler,
+                        token_output,
+                        command,
+                        clock.now(),
+                    );
+                    remember_pending_unload(
+                        unload_identity,
+                        &event,
+                        &runtime,
+                        &mut pending_unloads,
+                    );
+                    if let Some(stop) = stop {
+                        pending_event = Some(event);
+                        queued_events.clear();
+                        maintenance_events.clear();
+                        pending_unloads.clear();
+                        stop_after_event = Some(stop);
+                    } else if pending_event.is_none() {
+                        pending_event = Some(event);
+                    } else {
+                        queued_events.push_back(event);
+                    }
+                }
+                Err(ReceiveTimeoutError::Timeout) => {}
+                Err(ReceiveTimeoutError::Disconnected) => {
+                    shutdown_after_disconnect(runtime);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn finish_worker<L>(runtime: InferenceRuntime<L>, stop: WorkerStop)
+where
+    L: ModelLoader,
+{
+    if matches!(stop, WorkerStop::PreserveRuntime) {
+        std::mem::forget(runtime);
+    }
+}
+
+fn shutdown_after_disconnect<L>(mut runtime: InferenceRuntime<L>)
+where
+    L: ModelLoader,
+{
+    if runtime.shutdown().is_err() && runtime.owns_backend_resources() {
+        // The worker endpoint is gone, so no caller can drive or inspect further
+        // cleanup. Preserve native ownership rather than invoking an unverified
+        // implicit drop after explicit cleanup has failed.
+        std::mem::forget(runtime);
     }
 }
 
@@ -397,6 +449,7 @@ fn collect_naturally_completed_unloads<L>(
                 .model_lifecycle_state(*model_id)
                 .is_none()
                 .then_some((*model_id, *pending))
+                .filter(|_| !runtime.is_model_cleanup_pending(*model_id))
         })
         .collect::<Vec<_>>();
 
@@ -437,16 +490,17 @@ fn remember_pending_unload<L>(
         return;
     };
     let model_id = handle.id;
-    let pending = runtime
-        .model_lifecycle_state(model_id)
-        .is_some_and(|state| {
-            matches!(
-                state,
-                ModelLifecycleState::Draining { .. }
-                    | ModelLifecycleState::Cancelling { .. }
-                    | ModelLifecycleState::Unloading
-            )
-        });
+    let pending = runtime.is_model_cleanup_pending(model_id)
+        || runtime
+            .model_lifecycle_state(model_id)
+            .is_some_and(|state| {
+                matches!(
+                    state,
+                    ModelLifecycleState::Draining { .. }
+                        | ModelLifecycleState::Cancelling { .. }
+                        | ModelLifecycleState::Unloading
+                )
+            });
     if pending {
         let failure_reported = matches!(event, RuntimeEvent::ModelUnload { result: Err(_), .. });
         let cancelled_requests = match event {
@@ -454,10 +508,9 @@ fn remember_pending_unload<L>(
                 result: Ok(receipt),
                 ..
             } => receipt.cancelled_requests,
-            RuntimeEvent::ModelUnload {
-                result: Err(crate::RuntimeError::CleanupFailed(report)),
-                ..
-            } if report.primary_failure == crate::FailureClass::Cancellation => 1,
+            RuntimeEvent::ModelUnload { result: Err(_), .. } => runtime
+                .model_cancelled_requests_during_unload(model_id)
+                .unwrap_or(0),
             _ => 0,
         };
         pending_unloads.insert(
@@ -481,10 +534,10 @@ fn remember_pending_unload<L>(
 fn dispatch<L>(
     runtime: &mut InferenceRuntime<L>,
     scheduler: &mut GenerationScheduler,
-    _token_output: &TokenOutputProducer<GenerationOutputState>,
+    token_output: &TokenOutputProducer<GenerationOutputState>,
     command: RuntimeCommand<L::Source>,
     now: MonotonicMillis,
-) -> (RuntimeEvent, bool)
+) -> (RuntimeEvent, Option<WorkerStop>)
 where
     L: ModelLoader,
 {
@@ -500,7 +553,7 @@ where
                 ticket,
                 result: runtime.load_model(model_id, &source, device, device_kind),
             },
-            false,
+            None,
         ),
         RuntimeCommand::StartRequest {
             ticket,
@@ -511,9 +564,13 @@ where
         } => (
             RuntimeEvent::RequestStarted {
                 ticket,
-                result: runtime.start_request(handle, request_id, sequence_id, configuration),
+                result: if scheduler.contains(request_id) {
+                    Err(crate::RuntimeError::RequestAlreadyActive(request_id))
+                } else {
+                    runtime.start_request(handle, request_id, sequence_id, configuration)
+                },
             },
-            false,
+            None,
         ),
         RuntimeCommand::Generate {
             ticket,
@@ -522,9 +579,9 @@ where
         } => (
             RuntimeEvent::GenerationAdmitted {
                 ticket,
-                result: scheduler.admit(runtime, handle, request),
+                result: scheduler.admit(runtime, token_output, handle, request),
             },
-            false,
+            None,
         ),
         RuntimeCommand::Prefill {
             ticket,
@@ -549,7 +606,7 @@ where
                 request_id,
                 result: runtime.complete_request(request_id, reason),
             },
-            false,
+            None,
         ),
         RuntimeCommand::CancelRequest {
             ticket,
@@ -561,7 +618,7 @@ where
                 request_id,
                 result: scheduler.request_cancellation(request_id, reason),
             },
-            false,
+            None,
         ),
         RuntimeCommand::CancelRequest {
             ticket,
@@ -573,7 +630,7 @@ where
                 request_id,
                 result: runtime.cancel_request(request_id, reason),
             },
-            false,
+            None,
         ),
         RuntimeCommand::UnloadModel {
             ticket,
@@ -591,7 +648,7 @@ where
                     ticket,
                     result: runtime.unload_model(handle, policy, now),
                 },
-                false,
+                None,
             )
         }
         RuntimeCommand::Snapshot { ticket } => (
@@ -600,14 +657,23 @@ where
                 runtime: runtime.snapshot(),
                 models: runtime.model_snapshots(),
             },
-            false,
+            None,
         ),
         RuntimeCommand::Shutdown { ticket } => {
-            scheduler
-                .request_all_cancellation(domain_contracts::CancellationReason::RuntimeShutdown);
-            let result = runtime.shutdown();
-            let should_stop = result.is_ok();
-            (RuntimeEvent::Shutdown { ticket, result }, should_stop)
+            let mut result = runtime.shutdown();
+            if let Err(error) = scheduler.discard_all(runtime) {
+                if result.is_ok() {
+                    result = Err(error);
+                } else {
+                    runtime.record_maintenance_error(error);
+                }
+            }
+            let stop = if result.is_err() && runtime.owns_backend_resources() {
+                WorkerStop::PreserveRuntime
+            } else {
+                WorkerStop::DropRuntime
+            };
+            (RuntimeEvent::Shutdown { ticket, result }, Some(stop))
         }
     }
 }
@@ -619,7 +685,7 @@ fn dispatch_prefill<L>(
     tokens: &[domain_contracts::TokenId],
     emit_logits: bool,
     mut logits: Vec<f32>,
-) -> (RuntimeEvent, bool)
+) -> (RuntimeEvent, Option<WorkerStop>)
 where
     L: ModelLoader,
 {
@@ -631,7 +697,7 @@ where
             result,
             logits,
         },
-        false,
+        None,
     )
 }
 
@@ -641,7 +707,7 @@ fn dispatch_decode<L>(
     request_id: domain_contracts::RequestId,
     token: domain_contracts::TokenId,
     mut logits: Vec<f32>,
-) -> (RuntimeEvent, bool)
+) -> (RuntimeEvent, Option<WorkerStop>)
 where
     L: ModelLoader,
 {
@@ -653,6 +719,6 @@ where
             result,
             logits,
         },
-        false,
+        None,
     )
 }

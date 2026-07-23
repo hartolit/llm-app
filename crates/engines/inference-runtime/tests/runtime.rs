@@ -368,7 +368,10 @@ fn failed_sequence_release_preserves_request_for_retry() -> Result<(), String> {
         return Err("failed sequence release did not quarantine ownership".into());
     }
 
-    if !runtime.poll_cleanup().map_err(debug_error)? {
+    if !matches!(
+        runtime.poll_cleanup().map_err(debug_error)?,
+        inference_runtime::CleanupPoll::Released(_)
+    ) {
         return Err("pending cleanup was not retried".into());
     }
     if runtime.snapshot().pending_cleanup_sequences != 0 {

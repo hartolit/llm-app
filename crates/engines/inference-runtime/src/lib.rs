@@ -13,14 +13,15 @@ pub use command::{
     CommandTicket, DecodeReceipt, LoadReceipt, ModelSnapshot, PrefillReceipt, RequestStartReceipt,
     RuntimeCommand, RuntimeEvent, RuntimeSnapshot, ShutdownReceipt, UnloadReceipt, UnloadStatus,
 };
-pub use configuration::{HostedRuntimeConfiguration, RuntimeLimits};
+pub use configuration::{CleanupRetryPolicy, HostedRuntimeConfiguration, RuntimeLimits};
 pub use error::{
-    CleanupFailureReport, FailureClass, MemoryKind, RuntimeError, RuntimeOperation,
-    RuntimeReceiveError, RuntimeSubmitError, SamplingFailure,
+    CleanupFailureReport, CleanupPoll, CleanupResource, CleanupRetryState, FailureClass,
+    MemoryKind, RuntimeError, RuntimeOperation, RuntimeReceiveError, RuntimeSubmitError,
+    SamplingFailure,
 };
 pub use generation::{
-    GenerationAdmission, GenerationOutcome, GenerationOutputState, GenerationRequest,
-    GenerationStopSequence,
+    GenerationAdmission, GenerationOutcome, GenerationOutputCapacityPolicy, GenerationOutputState,
+    GenerationRequest, GenerationStopSequence,
 };
 pub use runtime::InferenceRuntime;
 pub use worker::{HostedRuntime, HostedRuntimeStartError, RuntimeThread, start_hosted_runtime};

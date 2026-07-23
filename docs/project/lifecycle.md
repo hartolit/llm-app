@@ -40,12 +40,23 @@ the normal active-request registry into runtime-owned quarantine. Its identity,
 model sequence slot, and memory footprint remain accounted, and the affected model
 rejects new requests until cleanup succeeds.
 
-Maintenance retries at most one quarantined cleanup operation per worker quantum.
-A retry failure remains observable through the original allocation-free
-`CleanupFailureReport`; a successful retry removes ownership and accounting exactly
-once. Model unload preparation follows the same rule: failure retains the model and
-its bytes, and success is the only permission to release it.
+Maintenance retries at most one non-exhausted quarantined cleanup operation per
+worker loop. The initial failed cleanup counts as attempt one; the default policy
+permits three total attempts and may be overridden through `CleanupRetryPolicy`.
+Each retry records inspectable attempt state in the runtime snapshot. After the total-attempt limit is
+reached, automatic maintenance skips the resource while retaining its ownership,
+capacity, and memory accounting. A successful retry removes ownership and
+accounting exactly once. Model unload preparation follows the same rule: failure
+retains the model and its bytes, and success is the only permission to release it.
 
-Generation output orders `Terminal`, optional `CleanupPending`, and `Released`
-records. Consequently, completion of token generation is not presented as proof
-that backend resources have already been released.
+Generation output orders `Terminal`, optional `CleanupPending`, optional
+`CleanupExhausted`, and `Released` records. A terminal generation task also retains
+its admitted host-workspace accounting until `Released` is published and the task
+storage is dropped. Consequently, completion of token generation is not presented
+as proof that backend resources or request-owned host storage have already been
+released.
+
+Shutdown consumes only the finite remaining cleanup budget. It returns
+`CleanupRetryExhausted` if a resource remains. Endpoint disconnection has an
+explicit fail-closed policy: unresolved native ownership is retained rather than
+being passed to an undocumented implicit `Drop` cleanup path.

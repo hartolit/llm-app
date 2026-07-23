@@ -178,6 +178,11 @@ pub trait LoadedModel {
 
     /// Prepares deterministic resource destruction after all sequences are gone.
     ///
+    /// A failure must leave the model value valid for a later explicit retry.
+    /// Success is the only transition that permits the owner to drop or consume
+    /// the model as fully released. Backends that cannot provide this retry
+    /// contract must not advertise unload through this interface.
+    ///
     /// # Errors
     ///
     /// Returns [`SynchronizationError`] when unloading is invalid or cancelled,

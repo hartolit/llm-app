@@ -14,8 +14,36 @@ const DEFAULT_TOKEN_OUTPUT_RECORD_CAPACITY: NonZeroUsize = match NonZeroUsize::n
     Some(value) => value,
     None => NonZeroUsize::MIN,
 };
+const DEFAULT_CLEANUP_MAXIMUM_ATTEMPTS: NonZeroU32 = match NonZeroU32::new(3) {
+    Some(value) => value,
+    None => NonZeroU32::MIN,
+};
 
-/// Hard model, request, and aggregate memory bounds.
+/// Deterministic total-attempt limit for explicit backend cleanup.
+///
+/// The initial failed cleanup operation counts as attempt one. Maintenance may
+/// retry only while the retained attempt count is below `maximum_attempts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanupRetryPolicy {
+    /// Maximum total cleanup attempts for one retained resource.
+    pub maximum_attempts: NonZeroU32,
+}
+
+impl CleanupRetryPolicy {
+    /// Creates a cleanup retry policy from an already validated non-zero limit.
+    #[must_use]
+    pub const fn new(maximum_attempts: NonZeroU32) -> Self {
+        Self { maximum_attempts }
+    }
+}
+
+impl Default for CleanupRetryPolicy {
+    fn default() -> Self {
+        Self::new(DEFAULT_CLEANUP_MAXIMUM_ATTEMPTS)
+    }
+}
+
+/// Hard model, request, aggregate memory, and cleanup bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeLimits {
     /// Maximum concurrently loaded model instances.
@@ -24,10 +52,12 @@ pub struct RuntimeLimits {
     pub maximum_active_requests: NonZeroU32,
     /// Aggregate resident memory budget enforced by the registry.
     pub memory_budget: MemoryBudget,
+    /// Bounded total-attempt policy for explicit cleanup.
+    pub cleanup_retry: CleanupRetryPolicy,
 }
 
 impl RuntimeLimits {
-    /// Creates runtime limits from already validated non-zero counts.
+    /// Creates runtime limits with the default bounded cleanup policy.
     #[must_use]
     pub const fn new(
         maximum_loaded_models: NonZeroU32,
@@ -38,7 +68,15 @@ impl RuntimeLimits {
             maximum_loaded_models,
             maximum_active_requests,
             memory_budget,
+            cleanup_retry: CleanupRetryPolicy::new(DEFAULT_CLEANUP_MAXIMUM_ATTEMPTS),
         }
+    }
+
+    /// Overrides the total-attempt cleanup policy.
+    #[must_use]
+    pub const fn with_cleanup_retry_policy(mut self, cleanup_retry: CleanupRetryPolicy) -> Self {
+        self.cleanup_retry = cleanup_retry;
+        self
     }
 }
 

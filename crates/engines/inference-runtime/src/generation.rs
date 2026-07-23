@@ -1,20 +1,20 @@
 //! Backend-independent generation admission and bounded scheduler state.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
+use std::mem::size_of;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use domain_contracts::{
-    CapacityExhausted, CapacityResource, FinishReason, ModelHandle, RequestId,
-    SequenceConfiguration, SequenceId, TokenId, YieldReason,
+    CapacityExhausted, CapacityResource, FinishReason, MemoryFootprint, ModelHandle, ModelLoader,
+    RequestId, SequenceConfiguration, SequenceId, TokenId, YieldReason,
 };
 use host_runtime::{OutputPushError, TokenOutputProducer};
 use sampling::{Sampler, SamplingConfig, SamplingWorkspace};
 
 use crate::{
-    CleanupFailureReport, FailureClass, InferenceRuntime, RequestStartReceipt, RuntimeError,
-    RuntimeOperation,
+    CleanupFailureReport, CleanupRetryState, FailureClass, InferenceRuntime, RequestStartReceipt,
+    RuntimeError, RuntimeOperation,
 };
-use domain_contracts::ModelLoader;
 
 /// One owned token stop pattern validated before generation begins.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,6 +23,32 @@ pub struct GenerationStopSequence {
     pub code: u32,
     /// Non-empty token pattern.
     pub tokens: Box<[TokenId]>,
+}
+
+/// Minimum shared pull-accumulator capacity required by one request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationOutputCapacityPolicy {
+    /// Minimum token identifiers that must fit before the consumer pulls.
+    pub minimum_tokens: NonZeroUsize,
+    /// Minimum token/state records that must fit before the consumer pulls.
+    pub minimum_records: NonZeroUsize,
+}
+
+impl GenerationOutputCapacityPolicy {
+    /// Creates an explicit output-capacity requirement.
+    #[must_use]
+    pub const fn new(minimum_tokens: NonZeroUsize, minimum_records: NonZeroUsize) -> Self {
+        Self {
+            minimum_tokens,
+            minimum_records,
+        }
+    }
+}
+
+impl Default for GenerationOutputCapacityPolicy {
+    fn default() -> Self {
+        Self::new(NonZeroUsize::MIN, NonZeroUsize::MIN)
+    }
 }
 
 /// Runtime-level generation request with no frontend or tokenizer state.
@@ -48,6 +74,8 @@ pub struct GenerationRequest {
     pub stop_sequences: Box<[GenerationStopSequence]>,
     /// Maximum backend steps for one scheduler opportunity.
     pub scheduler_quantum: NonZeroU32,
+    /// Minimum capacity required from the shared pull accumulator.
+    pub output_capacity: GenerationOutputCapacityPolicy,
 }
 
 /// Stable generation outcome retained independently from cleanup disposition.
@@ -72,6 +100,17 @@ pub enum GenerationOutputState {
         outcome: GenerationOutcome,
         /// Primary and cleanup failure classifications.
         failure: CleanupFailureReport,
+        /// Current bounded retry state.
+        retry: CleanupRetryState,
+    },
+    /// Automatic cleanup attempts are exhausted and ownership remains retained.
+    CleanupExhausted {
+        /// Original generation outcome.
+        outcome: GenerationOutcome,
+        /// Primary and cleanup failure classifications.
+        failure: CleanupFailureReport,
+        /// Exhausted bounded retry state.
+        retry: CleanupRetryState,
     },
     /// Sequence cleanup completed and request accounting was released.
     Released(GenerationOutcome),
@@ -88,7 +127,8 @@ pub struct GenerationAdmission {
 
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "the private generation module exposes scheduler state only to the sibling worker module"
+    reason = "the private generation module exposes scheduler state only to the sibling \
+              worker module"
 )]
 pub(super) struct GenerationScheduler {
     requests: BTreeMap<RequestId, GenerationTask>,
@@ -97,6 +137,7 @@ pub(super) struct GenerationScheduler {
 
 struct GenerationTask {
     handle: ModelHandle,
+    workspace_footprint: MemoryFootprint,
     prompt_tokens: Box<[TokenId]>,
     maximum_generated_tokens: usize,
     eos_tokens: Box<[TokenId]>,
@@ -124,15 +165,16 @@ enum GenerationPhase {
 #[derive(Clone, Copy)]
 struct TerminalPublication {
     outcome: GenerationOutcome,
-    cleanup_pending: bool,
-    cleanup_failure: Option<CleanupFailureReport>,
+    initial_cleanup: Option<CleanupRetryState>,
     terminal_published: bool,
     cleanup_published: bool,
+    exhaustion_published: bool,
 }
 
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "the private generation module exposes scheduler progress only to the sibling worker module"
+    reason = "the private generation module exposes scheduler progress only to the sibling \
+              worker module"
 )]
 pub(super) struct SchedulerAdvance {
     pub(super) progressed: bool,
@@ -145,10 +187,6 @@ impl GenerationScheduler {
             requests: BTreeMap::new(),
             cursor: None,
         }
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.requests.is_empty()
     }
 
     pub(super) fn contains(&self, request_id: RequestId) -> bool {
@@ -168,15 +206,6 @@ impl GenerationScheduler {
         Ok(())
     }
 
-    pub(super) fn request_all_cancellation(
-        &mut self,
-        reason: domain_contracts::CancellationReason,
-    ) {
-        for task in self.requests.values_mut() {
-            task.cancellation = Some(reason);
-        }
-    }
-
     pub(super) fn request_model_cancellation(
         &mut self,
         model_id: domain_contracts::ModelId,
@@ -189,9 +218,32 @@ impl GenerationScheduler {
         }
     }
 
+    pub(super) fn discard_all<L: ModelLoader>(
+        &mut self,
+        runtime: &mut InferenceRuntime<L>,
+    ) -> Result<(), RuntimeError> {
+        self.cursor = None;
+        let tasks = std::mem::take(&mut self.requests);
+        let mut first_error = None;
+        for task in tasks.into_values() {
+            if let Err(error) = runtime.release_generation_workspace(task.workspace_footprint)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cold admission keeps validation, allocation, backend creation, rollback, and publication contiguous"
+    )]
     pub(super) fn admit<L: ModelLoader>(
         &mut self,
         runtime: &mut InferenceRuntime<L>,
+        output: &TokenOutputProducer<GenerationOutputState>,
         handle: ModelHandle,
         request: GenerationRequest,
     ) -> Result<GenerationAdmission, RuntimeError> {
@@ -200,6 +252,29 @@ impl GenerationScheduler {
         }
         if request.prompt_tokens.is_empty() {
             return Err(token_capacity(1, 0));
+        }
+        let maximum_prefill_batch = usize::try_from(request.sequence.maximum_prefill_batch.get())
+            .map_err(|_| RuntimeError::BackendContractViolation)?;
+        if request.prompt_tokens.len() > maximum_prefill_batch {
+            return Err(token_capacity(
+                request.prompt_tokens.len(),
+                maximum_prefill_batch,
+            ));
+        }
+        let (token_output_capacity, record_output_capacity) = output.capacities();
+        if request.output_capacity.minimum_tokens.get() > token_output_capacity {
+            return Err(capacity_error(
+                CapacityResource::Tokens,
+                request.output_capacity.minimum_tokens.get(),
+                token_output_capacity,
+            ));
+        }
+        if request.output_capacity.minimum_records.get() > record_output_capacity {
+            return Err(capacity_error(
+                CapacityResource::OutputRecords,
+                request.output_capacity.minimum_records.get(),
+                record_output_capacity,
+            ));
         }
         for stop in &request.stop_sequences {
             if stop.tokens.is_empty() {
@@ -220,9 +295,7 @@ impl GenerationScheduler {
             return Err(token_capacity(required_sequence, sequence_capacity));
         }
 
-        let snapshot = runtime
-            .model_snapshot(handle)
-            .ok_or(RuntimeError::ModelNotLoaded(handle.id))?;
+        let snapshot = runtime.exact_model_snapshot(handle)?;
         if snapshot.degraded {
             return Err(RuntimeError::ModelDegraded(handle.id));
         }
@@ -230,6 +303,22 @@ impl GenerationScheduler {
             .map_err(|_| RuntimeError::BackendContractViolation)?;
         let sampler = Sampler::new(request.sampling, request.seed)
             .map_err(|error| RuntimeError::Sampling(error.into()))?;
+        let workspace_footprint = generation_workspace_footprint(
+            vocabulary_size,
+            required_sequence,
+            maximum_generated_tokens,
+            request.prompt_tokens.len(),
+            request.eos_tokens.len(),
+            &request.stop_sequences,
+        )?;
+        runtime.preflight_generation_resources(
+            handle,
+            request.request_id,
+            request.sequence_id,
+            request.sequence,
+            workspace_footprint,
+            vocabulary_size,
+        )?;
 
         let mut logits = reserved_f32(vocabulary_size, CapacityResource::Logits)?;
         logits.resize(vocabulary_size, 0.0);
@@ -242,19 +331,23 @@ impl GenerationScheduler {
         history.extend_from_slice(&request.prompt_tokens);
         let generated = reserved_tokens(maximum_generated_tokens, CapacityResource::Tokens)?;
 
-        let receipt = runtime.start_request(
+        let receipt = runtime.start_generation_request(
             handle,
             request.request_id,
             request.sequence_id,
             request.sequence,
+            workspace_footprint,
+            vocabulary_size,
         )?;
-        if receipt.logits_capacity > vocabulary_size {
+        if receipt.logits_capacity != vocabulary_size {
             let primary = RuntimeError::BackendContractViolation;
-            runtime.fail_request(
+            let cleanup = runtime.fail_request(
                 request.request_id,
                 RuntimeOperation::SequenceAdmission,
                 primary.failure_class(),
-            )?;
+            );
+            runtime.release_generation_workspace(workspace_footprint)?;
+            cleanup?;
             return Err(primary);
         }
 
@@ -266,6 +359,7 @@ impl GenerationScheduler {
             request.request_id,
             GenerationTask {
                 handle,
+                workspace_footprint,
                 prompt_tokens: request.prompt_tokens,
                 maximum_generated_tokens,
                 eos_tokens: request.eos_tokens,
@@ -308,7 +402,15 @@ impl GenerationScheduler {
             advance_task(runtime, output, request_id, task)
         };
         if result.completed == Some(request_id) {
-            self.requests.remove(&request_id);
+            if let Some(task) = self.requests.remove(&request_id) {
+                let workspace_footprint = task.workspace_footprint;
+                drop(task);
+                if let Err(error) = runtime.release_generation_workspace(workspace_footprint) {
+                    runtime.record_maintenance_error(error);
+                }
+            } else {
+                runtime.record_maintenance_error(RuntimeError::BackendContractViolation);
+            }
         }
         result
     }
@@ -356,7 +458,12 @@ fn advance_task<L: ModelLoader>(
                 .request_cleanup_failure(request_id)
                 .map(RuntimeError::CleanupFailed)
         };
-        task.phase = terminal_phase(GenerationOutcome::Finished(finish), cleanup_error);
+        task.phase = terminal_phase(
+            runtime,
+            request_id,
+            GenerationOutcome::Finished(finish),
+            cleanup_error,
+        );
         return progressed();
     }
 
@@ -373,7 +480,12 @@ fn advance_task<L: ModelLoader>(
                 task.pending_token = None;
                 if let Some(reason) = task.finish_after_token(token) {
                     let cleanup = runtime.complete_request(request_id, reason).err();
-                    task.phase = terminal_phase(GenerationOutcome::Finished(reason), cleanup);
+                    task.phase = terminal_phase(
+                        runtime,
+                        request_id,
+                        GenerationOutcome::Finished(reason),
+                        cleanup,
+                    );
                 } else {
                     task.phase = GenerationPhase::Decode;
                 }
@@ -411,6 +523,8 @@ fn advance_task<L: ModelLoader>(
             GenerationPhase::Decode => {
                 let Some(token) = task.generated.last().copied() else {
                     task.phase = terminal_phase(
+                        runtime,
+                        request_id,
                         GenerationOutcome::Failed(RuntimeError::BackendContractViolation),
                         None,
                     );
@@ -433,11 +547,11 @@ fn advance_task<L: ModelLoader>(
         let logits_written = match backend_result {
             Ok(Ok(written)) => written,
             Ok(Err(outcome)) => {
-                task.phase = terminal_phase(outcome, None);
+                task.phase = terminal_phase(runtime, request_id, outcome, None);
                 return progressed();
             }
             Err(error) => {
-                task.phase = terminal_phase_from_runtime_error(error);
+                task.phase = terminal_phase_from_runtime_error(runtime, request_id, error);
                 return progressed();
             }
         };
@@ -450,7 +564,12 @@ fn advance_task<L: ModelLoader>(
                     primary.failure_class(),
                 )
                 .err();
-            task.phase = terminal_phase(GenerationOutcome::Failed(primary), cleanup);
+            task.phase = terminal_phase(
+                runtime,
+                request_id,
+                GenerationOutcome::Failed(primary),
+                cleanup,
+            );
             return progressed();
         };
 
@@ -473,7 +592,12 @@ fn advance_task<L: ModelLoader>(
                         FailureClass::Sampling,
                     )
                     .err();
-                task.phase = terminal_phase(GenerationOutcome::Failed(primary), cleanup);
+                task.phase = terminal_phase(
+                    runtime,
+                    request_id,
+                    GenerationOutcome::Failed(primary),
+                    cleanup,
+                );
                 return progressed();
             }
         };
@@ -523,28 +647,51 @@ fn publish_terminal<L: ModelLoader>(
         terminal.terminal_published = true;
         return progressed();
     }
-    if terminal.cleanup_pending && !terminal.cleanup_published {
-        let Some(failure) = terminal.cleanup_failure else {
-            return idle();
-        };
-        if output
-            .try_push_state(
-                request_id,
-                GenerationOutputState::CleanupPending {
-                    outcome: terminal.outcome,
-                    failure,
-                },
-            )
-            .is_err()
-        {
+
+    if let Some(initial_cleanup) = terminal.initial_cleanup {
+        if !terminal.cleanup_published {
+            let retry = runtime
+                .request_cleanup_state(request_id)
+                .unwrap_or(initial_cleanup);
+            if output
+                .try_push_state(
+                    request_id,
+                    GenerationOutputState::CleanupPending {
+                        outcome: terminal.outcome,
+                        failure: retry.failure,
+                        retry,
+                    },
+                )
+                .is_err()
+            {
+                return idle();
+            }
+            terminal.cleanup_published = true;
+            return progressed();
+        }
+
+        if let Some(retry) = runtime.request_cleanup_state(request_id) {
+            if retry.exhausted() && !terminal.exhaustion_published {
+                if output
+                    .try_push_state(
+                        request_id,
+                        GenerationOutputState::CleanupExhausted {
+                            outcome: terminal.outcome,
+                            failure: retry.failure,
+                            retry,
+                        },
+                    )
+                    .is_err()
+                {
+                    return idle();
+                }
+                terminal.exhaustion_published = true;
+                return progressed();
+            }
             return idle();
         }
-        terminal.cleanup_published = true;
-        return progressed();
     }
-    if terminal.cleanup_pending && runtime.is_request_cleanup_pending(request_id) {
-        return idle();
-    }
+
     if output
         .try_push_state(
             request_id,
@@ -560,37 +707,65 @@ fn publish_terminal<L: ModelLoader>(
     }
 }
 
-const fn terminal_phase(
+fn terminal_phase<L: ModelLoader>(
+    runtime: &InferenceRuntime<L>,
+    request_id: RequestId,
     outcome: GenerationOutcome,
     cleanup_error: Option<RuntimeError>,
 ) -> GenerationPhase {
-    let (outcome, cleanup_failure) = match cleanup_error {
-        Some(RuntimeError::CleanupFailed(report)) => (outcome, Some(report)),
-        Some(error) => (GenerationOutcome::Failed(error), None),
-        None => (outcome, None),
+    let retained_cleanup = runtime.request_cleanup_state(request_id);
+    let (outcome, initial_cleanup) = match cleanup_error {
+        Some(error @ RuntimeError::CleanupFailed(_)) => {
+            let cleanup =
+                retained_cleanup.or_else(|| cleanup_state_from_error(runtime, request_id, error));
+            if cleanup.is_some() {
+                (outcome, cleanup)
+            } else {
+                (GenerationOutcome::Failed(error), None)
+            }
+        }
+        Some(error @ RuntimeError::CleanupRetryExhausted(_)) => (
+            outcome,
+            retained_cleanup.or_else(|| cleanup_state_from_error(runtime, request_id, error)),
+        ),
+        Some(error) => (GenerationOutcome::Failed(error), retained_cleanup),
+        None => (outcome, retained_cleanup),
     };
-    let cleanup_pending = cleanup_failure.is_some();
     GenerationPhase::Terminal(TerminalPublication {
         outcome,
-        cleanup_pending,
-        cleanup_failure,
+        initial_cleanup,
         terminal_published: false,
         cleanup_published: false,
+        exhaustion_published: false,
     })
 }
 
-const fn terminal_phase_from_runtime_error(error: RuntimeError) -> GenerationPhase {
-    let cleanup_failure = match error {
-        RuntimeError::CleanupFailed(report) => Some(report),
-        _ => None,
-    };
+fn terminal_phase_from_runtime_error<L: ModelLoader>(
+    runtime: &InferenceRuntime<L>,
+    request_id: RequestId,
+    error: RuntimeError,
+) -> GenerationPhase {
     GenerationPhase::Terminal(TerminalPublication {
         outcome: GenerationOutcome::Failed(error),
-        cleanup_pending: cleanup_failure.is_some(),
-        cleanup_failure,
+        initial_cleanup: runtime
+            .request_cleanup_state(request_id)
+            .or_else(|| cleanup_state_from_error(runtime, request_id, error)),
         terminal_published: false,
         cleanup_published: false,
+        exhaustion_published: false,
     })
+}
+
+fn cleanup_state_from_error<L: ModelLoader>(
+    runtime: &InferenceRuntime<L>,
+    request_id: RequestId,
+    error: RuntimeError,
+) -> Option<CleanupRetryState> {
+    match error {
+        RuntimeError::CleanupFailed(_) => runtime.request_cleanup_state(request_id),
+        RuntimeError::CleanupRetryExhausted(state) => Some(state),
+        _ => None,
+    }
 }
 
 const fn output_yield(error: OutputPushError) -> YieldReason {
@@ -603,6 +778,56 @@ const fn output_yield(error: OutputPushError) -> YieldReason {
         }
     };
     YieldReason::OutputBackpressure(capacity)
+}
+
+fn generation_workspace_footprint(
+    vocabulary_size: usize,
+    history_capacity: usize,
+    generated_capacity: usize,
+    prompt_tokens: usize,
+    eos_tokens: usize,
+    stop_sequences: &[GenerationStopSequence],
+) -> Result<MemoryFootprint, RuntimeError> {
+    let logits = allocation_bytes::<f32>(vocabulary_size)?;
+    let sampling_indices = allocation_bytes::<u32>(vocabulary_size)?;
+    let repetition_epochs = allocation_bytes::<u32>(vocabulary_size)?;
+    let history = allocation_bytes::<TokenId>(history_capacity)?;
+    let generated = allocation_bytes::<TokenId>(generated_capacity)?;
+    let prompt = allocation_bytes::<TokenId>(prompt_tokens)?;
+    let eos = allocation_bytes::<TokenId>(eos_tokens)?;
+    let stop_descriptors = allocation_bytes::<GenerationStopSequence>(stop_sequences.len())?;
+    let stop_tokens =
+        stop_sequences
+            .iter()
+            .try_fold(0_u64, |total, stop| -> Result<u64, RuntimeError> {
+                total
+                    .checked_add(allocation_bytes::<TokenId>(stop.tokens.len())?)
+                    .ok_or(RuntimeError::MemoryArithmeticOverflow)
+            })?;
+    let host_working_bytes = logits
+        .checked_add(sampling_indices)
+        .and_then(|value| value.checked_add(repetition_epochs))
+        .and_then(|value| value.checked_add(history))
+        .and_then(|value| value.checked_add(generated))
+        .and_then(|value| value.checked_add(prompt))
+        .and_then(|value| value.checked_add(eos))
+        .and_then(|value| value.checked_add(stop_descriptors))
+        .and_then(|value| value.checked_add(stop_tokens))
+        .ok_or(RuntimeError::MemoryArithmeticOverflow)?;
+    Ok(MemoryFootprint {
+        host_weight_bytes: 0,
+        device_weight_bytes: 0,
+        host_working_bytes,
+        device_working_bytes: 0,
+        cache_bytes_per_token: 0,
+    })
+}
+
+fn allocation_bytes<T>(length: usize) -> Result<u64, RuntimeError> {
+    let bytes = length
+        .checked_mul(size_of::<T>())
+        .ok_or(RuntimeError::MemoryArithmeticOverflow)?;
+    u64::try_from(bytes).map_err(|_| RuntimeError::MemoryArithmeticOverflow)
 }
 
 fn reserved_f32(length: usize, resource: CapacityResource) -> Result<Vec<f32>, RuntimeError> {
@@ -637,6 +862,14 @@ fn allocation_capacity(resource: CapacityResource, required: usize) -> RuntimeEr
         resource,
         u64::try_from(required).unwrap_or(u64::MAX),
         0,
+    ))
+}
+
+fn capacity_error(resource: CapacityResource, required: usize, available: usize) -> RuntimeError {
+    RuntimeError::CapacityExhausted(CapacityExhausted::new(
+        resource,
+        u64::try_from(required).unwrap_or(u64::MAX),
+        u64::try_from(available).unwrap_or(u64::MAX),
     ))
 }
 

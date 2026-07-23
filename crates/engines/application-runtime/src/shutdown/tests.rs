@@ -13,7 +13,8 @@ use domain_contracts::{
 };
 use host_runtime::spawn_named;
 use inference_runtime::{
-    HostedRuntimeConfiguration, LoadReceipt, RuntimeLimits, RuntimeThread, start_hosted_runtime,
+    CleanupResource, FailureClass, HostedRuntimeConfiguration, LoadReceipt, RuntimeLimits,
+    RuntimeOperation, RuntimeThread, start_hosted_runtime,
 };
 
 use super::*;
@@ -260,19 +261,32 @@ fn shutdown_cancels_active_request_and_unloads_model() -> TestResult {
 }
 
 #[test]
-fn unload_failure_is_returned_without_blocking_drop() -> TestResult {
+fn failed_cleanup_shutdown_stops_worker_without_dropping_client() -> TestResult {
     let (runtime, thread) = test_runtime(true)?;
     let _loaded = load_model(&runtime, 20)?;
 
     let outcome =
         shutdown_runtime_worker(&runtime, CommandTicket::new(21), TEST_TIMEOUT, TEST_POLL)
             .map_err(debug_error)?;
-    assert!(matches!(
-        outcome,
-        RuntimeShutdown::Finished(Err(RuntimeError::Synchronization(
-            SynchronizationError::Backend(_)
-        )))
-    ));
+    let RuntimeShutdown::Finished(Err(RuntimeError::CleanupRetryExhausted(state))) = outcome else {
+        return Err(format!("unexpected failed-cleanup shutdown: {outcome:?}"));
+    };
+    assert_eq!(
+        state.resource,
+        CleanupResource::Model {
+            model_id: ModelId::new(20),
+        }
+    );
+    assert_eq!(state.failure.primary_operation, RuntimeOperation::Shutdown);
+    assert_eq!(state.failure.primary_failure, FailureClass::Shutdown);
+    assert_eq!(
+        state.failure.cleanup_operation,
+        RuntimeOperation::ModelUnload
+    );
+    assert_eq!(state.failure.cleanup_failure, FailureClass::Synchronization);
+    assert_eq!(state.attempts, 3);
+    assert_eq!(state.maximum_attempts, 3);
+    assert!(state.exhausted());
     assert!(matches!(
         normalize_runtime_shutdown(outcome),
         Err(ApplicationError::Failure(ApplicationFailure {
@@ -281,7 +295,6 @@ fn unload_failure_is_returned_without_blocking_drop() -> TestResult {
         }))
     ));
 
-    drop(runtime);
     thread.join().map_err(debug_error)?;
     Ok(())
 }
