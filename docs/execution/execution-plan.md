@@ -473,39 +473,275 @@ Do not create another crate for these modules.
 
 ## Objective
 
-Connect prefill, sampling, decode, cancellation, stop conditions, backpressure, and cleanup without requiring a real model or UI.
+Connect prefill, sampling, decode, cancellation, stop conditions, backpressure, terminal cleanup, and resource accounting without requiring a real model or UI.
+
+The generation kernel must preserve the transactional ownership guarantees established in Phase 2. A generation request must never lose its model or sequence cleanup handle, silently release accounting, or erase the original failure when rollback or terminal cleanup also fails.
+
+## Work package 3.0 — Define rollback and terminal cleanup semantics
+
+Complete this work package before implementing the generation scheduler.
+
+### Objective
+
+Ensure that failed rollback or terminal cleanup does not lose the backend resource handle, corrupt resource accounting, or erase the failure that originally caused cleanup.
+
+The same cleanup state machine must support:
+
+* failed model admission;
+* failed sequence admission;
+* prefill failure;
+* decode failure;
+* sampling failure;
+* cancellation;
+* EOS completion;
+* token-limit completion;
+* stop-sequence completion;
+* output failure;
+* drain timeout escalation;
+* shutdown.
+
+### Preserve primary and cleanup failures
+
+A rollback or terminal transition may have two independently important failures:
+
+* the primary operation, validation, or generation failure;
+* the cleanup failure encountered while releasing the affected resource.
+
+Do not replace the primary failure with the cleanup failure.
+
+Add an allocation-free structured representation capable of retaining both failures. It should identify at least:
+
+* the primary operation;
+* the primary failure;
+* the cleanup operation;
+* the cleanup failure.
+
+The representation must distinguish cases such as:
+
+* backend contract violation followed by model-unload failure;
+* backend contract violation followed by sequence-destruction failure;
+* prefill failure followed by sequence-destruction failure;
+* decode failure followed by sequence-destruction failure;
+* cancellation followed by sequence-destruction failure;
+* shutdown failure followed by model-unload failure.
+
+Do not introduce recursive boxed errors or heap-allocated error chains into the runtime error taxonomy merely to reproduce `std::error::Error` source chaining.
+
+Stable error categories must remain suitable for translation by `application-runtime`.
+
+### Retain resources whose cleanup failed
+
+A model or sequence must not be dropped merely because its explicit cleanup operation failed.
+
+Introduce explicit pending-cleanup or quarantined ownership for:
+
+* loaded models that failed post-load validation and could not be prepared for unload;
+* sequences that failed post-creation validation and could not be destroyed;
+* committed generation sequences whose terminal destruction failed;
+* models that could not unload during shutdown or maintenance.
+
+Quarantined resources must not appear as normally usable entries in model, request, or sequence registries.
+
+The runtime must retain the only cleanup handle until one of the following occurs:
+
+* cleanup succeeds;
+* the backend explicitly reports that retry is impossible and ownership has already been consumed;
+* the process terminates.
+
+Do not rely on `Drop` as an undocumented substitute for explicit backend cleanup.
+
+### Maintain truthful accounting
+
+Resources awaiting cleanup must remain included in host and device memory accounting until cleanup succeeds.
+
+Snapshots and diagnostics should distinguish at least:
+
+* normally resident models;
+* active requests and sequences;
+* resources pending cleanup;
+* poisoned or degraded models;
+* total accounted host memory;
+* total accounted device memory.
+
+A failed cleanup must not make capacity appear available for new work when the backend may still own the resource.
+
+A quarantined sequence must continue to count against its model’s sequence and memory capacity until destruction succeeds.
+
+A quarantined model must continue to count against runtime model and memory capacity until unload preparation succeeds and the model is released.
+
+### Define degraded-state behavior
+
+Define how the runtime behaves after cleanup failure.
+
+At minimum:
+
+* the affected resource cannot accept new work;
+* a model with a quarantined sequence cannot be unloaded as though no sequences remain;
+* cleanup retries are explicit and bounded;
+* maintenance and shutdown process pending-cleanup resources;
+* successful cleanup removes the quarantined resource and releases its accounting;
+* repeated cleanup failure remains observable;
+* no resource is destroyed or unloaded again after confirmed successful cleanup;
+* normal request registries remain free of partially committed work.
+
+Prefer poisoning only the affected model when that is safe. Poison the entire runtime only when backend state can no longer be isolated or trusted.
+
+The runtime must expose enough state for `application-runtime` to report that cleanup is pending or that the model is degraded.
+
+### Clarify cleanup retry contracts
+
+Update backend contracts to state whether failed cleanup operations are safe to retry.
+
+For retryable sequence destruction:
+
+* `destroy_sequence()` must borrow the sequence;
+* failure must leave the sequence value valid for a later cleanup attempt;
+* success must be the only transition that permits the runtime to release the sequence and its accounting.
+
+For retryable model unloading:
+
+* `prepare_unload()` failure must leave the model valid for a later cleanup attempt;
+* success must establish that dropping or consuming the model is safe.
+
+If a backend cannot provide retryable cleanup, it must expose that limitation explicitly. The runtime must not infer retry safety from implementation details.
+
+### Define bounded retry policy
+
+Cleanup retries must not form an unbounded busy loop.
+
+Define:
+
+* when cleanup is retried;
+* the maximum attempts per maintenance quantum;
+* whether retries use a deadline, attempt limit, or both;
+* how shutdown interacts with unresolved cleanup;
+* how repeated failure is surfaced;
+* whether new requests may continue on unaffected models.
+
+Retries must remain responsive to control commands and shutdown deadlines.
+
+### Reuse one terminal cleanup state machine
+
+Admission rollback, normal completion, cancellation, generation failure, drain escalation, and shutdown must use the same underlying cleanup transition rules.
+
+A request may enter terminal cleanup only once.
+
+A sequence destruction operation may be attempted more than once only after a previous attempt failed and ownership was retained.
+
+After successful destruction:
+
+* no later cleanup attempt is permitted;
+* sequence accounting is released exactly once;
+* request accounting is released exactly once;
+* terminal state is published exactly once.
+
+### Fault-injection coverage
+
+Add deterministic tests for:
+
+* primary model validation failure plus unload failure;
+* primary sequence validation failure plus destruction failure;
+* preservation of both failure classifications;
+* retention of failed model cleanup ownership;
+* retention of failed sequence cleanup ownership;
+* retained memory accounting after cleanup failure;
+* retained sequence capacity after cleanup failure;
+* rejection of new work against a poisoned or quarantined model;
+* successful cleanup on a later maintenance attempt;
+* repeated cleanup failure;
+* bounded cleanup retries;
+* no second destruction after cleanup succeeds;
+* no second accounting release after cleanup succeeds;
+* shutdown with pending model cleanup;
+* shutdown with pending sequence cleanup.
+
+Update Phase 2 fault-injection assertions that currently treat failed explicit cleanup as though the resource were completely released.
+
+### Acceptance criteria
+
+* A failed rollback never loses the only cleanup handle.
+* Primary and cleanup failures are both observable.
+* Pending-cleanup resources remain included in capacity and memory accounting.
+* Pending-cleanup resources cannot serve normal work.
+* Cleanup retry behavior is bounded and deterministic.
+* Successful cleanup releases ownership and accounting exactly once.
+* Failed cleanup does not silently fall back to unverified `Drop` behavior.
+* Admission rollback and generation terminal paths use the same cleanup state machine.
+* Work packages 3.1 through 3.5 can rely on defined terminal ownership semantics.
 
 ## Work package 3.1 — Define the minimum generation request
 
-Add an internal/runtime-level generation configuration containing only proven requirements:
+Add an internal runtime-level generation configuration containing only proven requirements:
 
-- request and sequence identity;
-- prompt token storage;
-- maximum generated tokens;
-- model sequence capacity;
-- sampling configuration and seed;
-- EOS token set;
-- token-based stop sequences;
-- scheduler quantum;
-- output capacity policy.
+* request and sequence identity;
+* prompt token storage;
+* maximum generated tokens;
+* model sequence capacity;
+* sampling configuration and seed;
+* EOS token set;
+* token-based stop sequences;
+* scheduler quantum;
+* output capacity policy.
 
 Keep frontend-oriented settings separate. `application-runtime` will translate its public `GenerationSettings` into this runtime form.
 
-Do not put display strings, frontend DTOs, repository paths, or tokenizer objects in E0 generation contracts.
+Do not put display strings, frontend DTOs, repository paths, tokenizer objects, decoded text, or UI state in E0 generation contracts.
+
+Define explicit finish reasons for at least:
+
+* EOS;
+* generated-token limit;
+* stop sequence;
+* cancellation;
+* capacity exhaustion;
+* output backpressure yield;
+* backend failure;
+* sampling failure;
+* cleanup pending;
+* runtime shutdown.
+
+A yielded request must remain distinguishable from a terminal request.
+
+A request whose generation work is complete but whose sequence cleanup is pending must not be reported as fully released.
 
 ## Work package 3.2 — Allocate generation workspaces before the hot loop
 
 At request admission, allocate or reserve all request-owned storage:
 
-- logits;
-- sampling indices;
-- repetition mask/epoch storage;
-- prompt and generated-token history;
-- stop-matcher state;
-- any backend-required prefill/decode workspace;
-- bounded token output storage.
+* logits;
+* sampling indices;
+* repetition mask or epoch storage;
+* prompt-token history;
+* generated-token history;
+* stop-matcher state;
+* any backend-required prefill workspace;
+* any backend-required decode workspace;
+* bounded token-output storage;
+* terminal and cleanup state.
 
-Capacity failures must occur before generation begins or produce a documented graceful finish/yield. No unchecked resize is allowed inside the decode loop.
+Capacity failures must occur before generation begins or produce a documented graceful finish or yield.
+
+No unchecked resize is allowed inside the decode loop.
+
+The request-admission transaction must validate:
+
+* prompt length;
+* maximum generation length;
+* total sequence capacity;
+* logits capacity;
+* sampling workspace capacity;
+* repetition-history capacity;
+* stop-sequence matcher capacity;
+* output accumulator capacity;
+* host-memory capacity;
+* device-memory capacity;
+* model lifecycle;
+* model poison or quarantine state;
+* request and sequence identity availability.
+
+Workspace allocation must not publish request, sequence, lifecycle, or accounting state until all validation and backend sequence creation have succeeded.
+
+If backend sequence creation succeeds but later validation fails, Work package 3.0 cleanup semantics apply.
 
 ## Work package 3.3 — Add a bounded generation scheduler to the inference worker
 
@@ -513,66 +749,268 @@ The worker loop should alternate between:
 
 1. checking control commands;
 2. advancing active generation by a bounded quantum;
-3. processing unload deadlines and maintenance;
-4. flushing/publishing available output state.
+3. processing unload deadlines, pending cleanup, and maintenance;
+4. flushing or publishing available output state.
 
-Initial quantum may be one token for correctness. Later tuning may use a small token or time budget.
+The initial quantum may be one token for correctness. Later tuning may use a small token or time budget.
 
 Required scheduler properties:
 
-- cancellation is checked before every backend step;
-- unload/drain commands remain responsive;
-- one request cannot monopolize the worker indefinitely;
-- output backpressure yields rather than allocates or blocks permanently;
-- terminal paths always destroy the sequence exactly once;
-- usage counters remain correct across prefill and decode;
-- backend errors become stable runtime/application failures.
+* cancellation is checked before every backend step;
+* unload and drain commands remain responsive;
+* pending-cleanup work receives bounded maintenance opportunities;
+* one request cannot monopolize the worker indefinitely;
+* output backpressure yields rather than allocates or blocks permanently;
+* yielded requests retain all required state;
+* prefill occurs at most once per admitted request;
+* decode advances monotonically;
+* sampling occurs inside E0;
+* generated tokens are recorded before the next decode step;
+* usage counters remain correct across prefill and decode;
+* backend errors become stable runtime or application failures;
+* terminal publication and cleanup follow the state machine from Work package 3.0.
+
+Every request must transition through explicit states such as:
+
+* admitted;
+* prefill pending;
+* decoding;
+* yielded for output;
+* cancellation requested;
+* terminal cleanup;
+* cleanup pending;
+* completed;
+* failed.
+
+Equivalent names are acceptable, but implicit combinations of booleans should be avoided when they permit contradictory states.
+
+### Cancellation
+
+Cancellation must be checked:
+
+* before prefill;
+* after prefill and before sampling;
+* before each decode step;
+* before each sampling step;
+* after returning from a backend step;
+* before resuming from output backpressure.
+
+Cancellation latency is bounded by:
+
+* the configured scheduler quantum;
+* one currently executing backend operation;
+* the worker’s control-command polling cadence.
+
+Cancellation must not skip terminal cleanup.
+
+### Backpressure
+
+When token output capacity is full:
+
+* generation yields;
+* no additional backend decode step is performed;
+* no token is discarded;
+* no token is emitted twice;
+* the request remains resumable;
+* the worker remains responsive to cancellation, unload, and shutdown.
+
+Backpressure must not allocate additional storage or block the worker indefinitely.
+
+### Terminal cleanup
+
+Every terminal path enters the cleanup state machine exactly once.
+
+A successful sequence destruction is recorded at most once.
+
+If destruction fails:
+
+* the sequence remains runtime-owned;
+* sequence and memory accounting remain retained;
+* the generation result retains the primary outcome;
+* the cleanup failure is also observable;
+* bounded cleanup retries occur through maintenance;
+* no new work is admitted against a poisoned model when that cannot be done safely.
+
+A request must not disappear from all runtime-owned state while its backend sequence may still exist.
+
+### Fairness
+
+The scheduler must use a bounded policy that prevents starvation.
+
+At minimum:
+
+* each runnable request receives an opportunity to advance;
+* yielded requests do not spin while output remains full;
+* cleanup retries do not monopolize the worker;
+* drain and shutdown deadlines are checked between quanta;
+* a failing request does not prevent unrelated healthy requests from progressing unless the model or runtime must be poisoned.
 
 ## Work package 3.4 — Add pull-oriented token output
 
 Do not emit one channel event per token.
 
-Add a bounded token accumulator analogous to the existing text output accumulator. The inference worker writes token IDs and terminal/yield records; the application layer pulls batches on its own cadence.
+Add a bounded token accumulator analogous to the existing text output accumulator. The inference worker writes token IDs and terminal or yield records; the application layer pulls batches on its own cadence.
 
 The accumulator must:
 
-- allocate only during cold initialization;
-- expose borrowed batches;
-- preserve request identity;
-- represent token ranges, yielded state, and terminal state;
-- provide a monotonic cursor;
-- use nonblocking producer behavior;
-- turn full capacity into `OutputBackpressure`;
-- retain allocations after each pull.
+* allocate only during cold initialization;
+* expose borrowed batches;
+* preserve request identity;
+* represent token ranges;
+* represent yielded state;
+* represent generation-terminal state;
+* represent cleanup-pending state;
+* represent fully released terminal state;
+* provide a monotonic cursor;
+* use nonblocking producer behavior;
+* turn full capacity into `OutputBackpressure`;
+* retain allocations after each pull.
 
 Keep the existing text accumulator for frontend-facing decoded text. Do not misuse UTF-8 byte ranges to represent token IDs.
 
+### Cursor and delivery invariants
+
+The token-output cursor must:
+
+* advance monotonically;
+* never reuse a token range;
+* allow consumers to detect missed or stale reads;
+* preserve ordering within a request;
+* preserve terminal ordering after the final token;
+* distinguish generation completion from resource cleanup completion.
+
+Pulling output must not:
+
+* allocate in proportion to token count;
+* copy the entire accumulated history;
+* advance generation directly;
+* perform tokenization or detokenization inside E0;
+* release backend resources.
+
+### Backpressure recovery
+
+After the application layer consumes output:
+
+* capacity becomes reusable without reallocating;
+* the generation request becomes runnable again;
+* the next scheduler quantum resumes from the exact prior state;
+* no token is regenerated merely because publication was delayed.
+
 ## Work package 3.5 — Build a deterministic fake model
 
-Create a small test backend with a fixed vocabulary and deterministic logits. It should support scenarios such as:
+Create a small test backend with a fixed vocabulary and deterministic logits.
 
-- greedy output sequence;
-- seeded stochastic output;
-- EOS completion;
-- token-limit completion;
-- stop-sequence completion;
-- cancellation between decode steps;
-- output backpressure and resume;
-- backend prefill/decode failure;
-- capacity exhaustion;
-- drain timeout escalation.
+It should support scenarios such as:
 
-The test backend should be small enough for ordinary CI and should not download model files.
+* greedy output sequence;
+* seeded stochastic output;
+* EOS completion;
+* token-limit completion;
+* stop-sequence completion;
+* cancellation before prefill;
+* cancellation between decode steps;
+* cancellation while output is backpressured;
+* output backpressure and resume;
+* backend prefill failure;
+* backend decode failure;
+* sampling failure;
+* capacity exhaustion;
+* drain timeout escalation;
+* sequence destruction failure;
+* sequence destruction failure after a generation failure;
+* successful cleanup retry;
+* repeated cleanup failure;
+* model poisoning or quarantine;
+* unaffected request progress when isolation permits it.
+
+The test backend should be small enough for ordinary CI and must not download model files.
+
+Its behavior must be controllable through deterministic fault-injection configuration rather than timing-sensitive races.
+
+The fake model should expose counters for at least:
+
+* model loads;
+* model unload attempts;
+* sequence creation;
+* sequence destruction attempts;
+* successful sequence destruction;
+* prefill calls;
+* decode calls;
+* sampling opportunities;
+* active native resources;
+* retained simulated memory.
+
+These counters should make duplicate cleanup, leaked ownership, or incorrect scheduler advancement observable.
+
+## Documentation
+
+Update:
+
+* `crates/engines/inference-runtime/README.md`;
+* `docs/project/inference-runtime.md`;
+* `docs/project/implementation-status.md`;
+* runtime lifecycle and failure-taxonomy documentation;
+* backend contract documentation;
+* any architecture diagrams that describe request ownership.
+
+Document:
+
+* the generation request lifecycle;
+* scheduler fairness and quantum behavior;
+* cancellation guarantees;
+* backpressure behavior;
+* terminal finish reasons;
+* pending-cleanup ownership;
+* cleanup retry semantics;
+* model or runtime poisoning policy;
+* accounting behavior during cleanup failure;
+* the distinction between generation completion and resource release.
+
+Do not describe GPU execution, real-model generation, frontend streaming, or tokenizer integration as complete during this phase.
+
+## Validation
+
+Run the current canonical root verification command:
+
+```text
+cargo run --locked --bin llm-app -- verify
+```
+
+Also run the relevant CI-equivalent checks required by the repository, including:
+
+```text
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo deny check
+git diff --check
+```
+
+Run configured portability and link checks when changes affect portable contracts, feature crates, documentation links, or target-specific compilation.
+
+Do not report `cargo xtask verify` as required during this phase. The xtask migration remains deferred to its planned tooling phase.
 
 ## Acceptance criteria
 
-- A prompt token sequence generates deterministic token output through the hosted runtime.
-- Sampling is invoked inside E0 rather than by the UI.
-- Cancellation latency is bounded by the configured scheduler quantum and backend step.
-- Backpressure pauses and resumes generation without losing or duplicating tokens.
-- Every terminal path destroys its sequence exactly once.
-- Tests cover greedy, stochastic, EOS, token limit, stop, cancellation, error, and capacity outcomes.
-- The UI is not involved in advancing token steps.
+* A prompt token sequence generates deterministic token output through the hosted runtime.
+* Sampling is invoked inside E0 rather than by the UI.
+* Prefill occurs once and decode advances through bounded scheduler quanta.
+* Cancellation latency is bounded by the configured scheduler quantum and one backend step.
+* Backpressure pauses and resumes generation without losing or duplicating tokens.
+* One request cannot monopolize the worker indefinitely.
+* Control commands, drain deadlines, maintenance, and cleanup remain responsive.
+* Greedy and seeded stochastic generation are deterministic under the fake backend.
+* EOS, token limit, stop sequence, cancellation, capacity exhaustion, and backend failure produce stable finish reasons.
+* Every terminal path enters the cleanup state machine exactly once.
+* Successful sequence cleanup releases ownership and accounting exactly once.
+* Failed cleanup preserves the sequence cleanup handle.
+* Failed cleanup preserves both the primary outcome and cleanup failure.
+* Pending-cleanup resources remain included in capacity and memory accounting.
+* Pending-cleanup resources cannot incorrectly serve new work.
+* Cleanup retries are bounded and deterministic.
+* A backend generation failure followed by a cleanup failure preserves both failures and does not publish the resource as released.
+* Tests cover greedy, stochastic, EOS, token limit, stop, cancellation, backpressure, backend error, cleanup error, retry, drain escalation, and capacity outcomes.
+* The UI is not involved in advancing token steps.
+* No real model download is required for ordinary Phase 3 tests.
+* Documentation accurately distinguishes completed functionality from later-phase work.
 
 ---
 
