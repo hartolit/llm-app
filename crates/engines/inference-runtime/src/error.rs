@@ -9,6 +9,122 @@ use core::fmt::{self, Debug, Formatter};
 
 use crate::RuntimeCommand;
 
+/// Runtime operation that produced a primary or cleanup failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeOperation {
+    /// Validation after loading a native model.
+    ModelAdmission,
+    /// Validation after creating a native sequence.
+    SequenceAdmission,
+    /// Prompt prefill.
+    Prefill,
+    /// Incremental decode.
+    Decode,
+    /// Token sampling.
+    Sampling,
+    /// Explicit request completion.
+    Completion,
+    /// Request cancellation.
+    Cancellation,
+    /// Sequence destruction.
+    SequenceDestruction,
+    /// Model unload preparation.
+    ModelUnload,
+    /// Runtime shutdown.
+    Shutdown,
+}
+
+/// Allocation-free stable classification retained across cleanup boundaries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailureClass {
+    /// A backend contradicted an accepted plan or identity.
+    BackendContract,
+    /// Model loading failed.
+    Load,
+    /// A loaded-model operation failed.
+    Model,
+    /// A sequence operation failed.
+    Sequence,
+    /// Synchronization or unload preparation failed.
+    Synchronization,
+    /// A lifecycle transition failed.
+    Lifecycle,
+    /// A fixed capacity or aggregate memory bound was exceeded.
+    Capacity,
+    /// Sampling configuration or execution failed.
+    Sampling,
+    /// Generation reached an expected terminal condition before cleanup failed.
+    Completion,
+    /// A request was cancelled.
+    Cancellation,
+    /// Runtime shutdown terminated generation.
+    Shutdown,
+    /// Runtime registry state was inconsistent.
+    Invariant,
+}
+
+/// Primary failure plus the independently important cleanup failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CleanupFailureReport {
+    /// Operation that produced the original outcome.
+    pub primary_operation: RuntimeOperation,
+    /// Stable classification of the original outcome.
+    pub primary_failure: FailureClass,
+    /// Explicit cleanup operation that subsequently failed.
+    pub cleanup_operation: RuntimeOperation,
+    /// Stable classification of the cleanup failure.
+    pub cleanup_failure: FailureClass,
+}
+
+impl CleanupFailureReport {
+    /// Creates a structured two-failure report without allocation.
+    #[must_use]
+    pub const fn new(
+        primary_operation: RuntimeOperation,
+        primary_failure: FailureClass,
+        cleanup_operation: RuntimeOperation,
+        cleanup_failure: FailureClass,
+    ) -> Self {
+        Self {
+            primary_operation,
+            primary_failure,
+            cleanup_operation,
+            cleanup_failure,
+        }
+    }
+}
+
+/// Stable sampling failure category exposed by the runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SamplingFailure {
+    /// Immutable sampling settings were invalid.
+    InvalidConfiguration,
+    /// Logits or candidate weights could not produce a token.
+    NoCandidate,
+    /// Sampling input referred to an invalid token or vocabulary.
+    InvalidInput,
+    /// Caller-owned sampling workspace was too small.
+    CapacityExhausted(CapacityExhausted),
+}
+
+impl From<sampling::SamplingError> for SamplingFailure {
+    fn from(value: sampling::SamplingError) -> Self {
+        match value {
+            sampling::SamplingError::InvalidConfiguration(_) => Self::InvalidConfiguration,
+            sampling::SamplingError::EmptyLogits | sampling::SamplingError::NoCandidate => {
+                Self::NoCandidate
+            }
+            sampling::SamplingError::CapacityExhausted(capacity) => {
+                Self::CapacityExhausted(capacity)
+            }
+            _ => Self::InvalidInput,
+        }
+    }
+}
+
 /// Memory domain whose aggregate budget was exceeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryKind {
@@ -77,6 +193,43 @@ pub enum RuntimeError {
     Lifecycle(LifecycleError),
     /// Backend returned a handle or metadata inconsistent with its accepted plan.
     BackendContractViolation,
+    /// The addressed model owns a resource awaiting explicit cleanup.
+    ModelDegraded(ModelId),
+    /// Sampling failed inside the generation kernel.
+    Sampling(SamplingFailure),
+    /// Cleanup failed after an independently important primary outcome.
+    CleanupFailed(CleanupFailureReport),
+}
+
+impl RuntimeError {
+    /// Returns the allocation-free stable class used in cleanup reports.
+    #[must_use]
+    pub const fn failure_class(self) -> FailureClass {
+        match self {
+            Self::Load(_) => FailureClass::Load,
+            Self::Model(_) => FailureClass::Model,
+            Self::Sequence(_) => FailureClass::Sequence,
+            Self::Synchronization(_) => FailureClass::Synchronization,
+            Self::Lifecycle(_) => FailureClass::Lifecycle,
+            Self::CapacityExhausted(_)
+            | Self::InsufficientMemory { .. }
+            | Self::LoadedModelLimit { .. } => FailureClass::Capacity,
+            Self::Sampling(_) => FailureClass::Sampling,
+            Self::ShuttingDown => FailureClass::Shutdown,
+            Self::BackendContractViolation => FailureClass::BackendContract,
+            Self::CleanupFailed(report) => report.primary_failure,
+            Self::ModelAlreadyLoaded(_)
+            | Self::ModelNotLoaded(_)
+            | Self::StaleModelHandle { .. }
+            | Self::RequestAlreadyActive(_)
+            | Self::RequestNotActive(_)
+            | Self::SequenceAlreadyActive(_)
+            | Self::ModelGenerationExhausted(_)
+            | Self::MemoryArithmeticOverflow
+            | Self::MemoryArithmeticUnderflow
+            | Self::ModelDegraded(_) => FailureClass::Invariant,
+        }
+    }
 }
 
 impl From<CapacityExhausted> for RuntimeError {

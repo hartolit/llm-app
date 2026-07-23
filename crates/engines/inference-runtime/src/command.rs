@@ -8,7 +8,7 @@ use domain_contracts::{
     RequestId, SequenceConfiguration, SequenceId, TokenId, UnloadPolicy,
 };
 
-use crate::RuntimeError;
+use crate::{GenerationAdmission, GenerationRequest, RuntimeError};
 
 /// Caller-assigned command correlation value.
 #[repr(transparent)]
@@ -100,8 +100,12 @@ pub struct RuntimeSnapshot {
     pub loaded_models: u32,
     /// Number of active request-owned sequences.
     pub active_requests: u32,
-    /// Aggregate reserved resident footprint.
+    /// Aggregate reserved resident footprint, including quarantined resources.
     pub reserved_footprint: MemoryFootprint,
+    /// Loaded models retained only for pending cleanup.
+    pub pending_cleanup_models: u32,
+    /// Sequences retained only for pending cleanup.
+    pub pending_cleanup_sequences: u32,
     /// Whether shutdown rejects new work.
     pub shutting_down: bool,
 }
@@ -117,8 +121,12 @@ pub struct ModelSnapshot {
     pub descriptor: ModelDescriptor,
     /// Model and active-sequence bytes currently reserved under this slot.
     pub reserved_footprint: MemoryFootprint,
-    /// Number of request-owned sequences in the slot.
+    /// Number of normally active request-owned sequences in the slot.
     pub active_requests: u32,
+    /// Number of quarantined sequences awaiting explicit destruction.
+    pub pending_cleanup_sequences: u32,
+    /// Whether cleanup failure prevents new request admission.
+    pub degraded: bool,
 }
 
 /// Successful runtime shutdown receipt.
@@ -157,6 +165,15 @@ pub enum RuntimeCommand<S> {
         sequence_id: SequenceId,
         /// Cold-path sequence bounds.
         configuration: SequenceConfiguration,
+    },
+    /// Admit a complete generation request for worker-owned scheduling.
+    Generate {
+        /// Correlation ticket.
+        ticket: CommandTicket,
+        /// Exact resident model generation.
+        handle: ModelHandle,
+        /// Token-level runtime request and preallocated policy bounds.
+        request: GenerationRequest,
     },
     /// Execute checked prompt prefill using caller-owned reusable logits storage.
     Prefill {
@@ -228,6 +245,7 @@ impl<S> RuntimeCommand<S> {
         match self {
             Self::LoadModel { ticket, .. }
             | Self::StartRequest { ticket, .. }
+            | Self::Generate { ticket, .. }
             | Self::Prefill { ticket, .. }
             | Self::Decode { ticket, .. }
             | Self::CompleteRequest { ticket, .. }
@@ -254,6 +272,22 @@ pub enum RuntimeEvent {
         ticket: CommandTicket,
         /// Start result.
         result: Result<RequestStartReceipt, RuntimeError>,
+    },
+    /// Completion of generation admission; token steps continue inside the worker.
+    GenerationAdmitted {
+        /// Correlation ticket.
+        ticket: CommandTicket,
+        /// Request admission result.
+        result: Result<GenerationAdmission, RuntimeError>,
+    },
+    /// A cancellation request was recorded for a scheduled generation.
+    GenerationCancellationRequested {
+        /// Correlation ticket.
+        ticket: CommandTicket,
+        /// Request identity.
+        request_id: RequestId,
+        /// Control-plane result; terminal cleanup is published through token output.
+        result: Result<(), RuntimeError>,
     },
     /// Completion of checked prompt prefill.
     PrefillCompleted {
@@ -318,6 +352,8 @@ impl RuntimeEvent {
         match self {
             Self::ModelLoaded { ticket, .. }
             | Self::RequestStarted { ticket, .. }
+            | Self::GenerationAdmitted { ticket, .. }
+            | Self::GenerationCancellationRequested { ticket, .. }
             | Self::PrefillCompleted { ticket, .. }
             | Self::DecodeCompleted { ticket, .. }
             | Self::RequestFinished { ticket, .. }

@@ -30,3 +30,22 @@ contracts:
 A cooperative in-process backend may delay physical reclamation until its current
 bounded step returns. The runtime must never drop a model concurrently with an
 active backend call.
+
+## Terminal cleanup and degraded state
+
+All generation terminal paths—EOS, token limit, stop match, cancellation, backend
+failure, sampling failure, drain escalation, and shutdown—use the same explicit
+sequence-destruction transition. A destruction failure moves the sequence out of
+the normal active-request registry into runtime-owned quarantine. Its identity,
+model sequence slot, and memory footprint remain accounted, and the affected model
+rejects new requests until cleanup succeeds.
+
+Maintenance retries at most one quarantined cleanup operation per worker quantum.
+A retry failure remains observable through the original allocation-free
+`CleanupFailureReport`; a successful retry removes ownership and accounting exactly
+once. Model unload preparation follows the same rule: failure retains the model and
+its bytes, and success is the only permission to release it.
+
+Generation output orders `Terminal`, optional `CleanupPending`, and `Released`
+records. Consequently, completion of token generation is not presented as proof
+that backend resources have already been released.

@@ -12,8 +12,9 @@ use domain_contracts::{
 };
 
 use crate::{
-    DecodeReceipt, LoadReceipt, MemoryKind, ModelSnapshot, PrefillReceipt, RequestStartReceipt,
-    RuntimeError, RuntimeLimits, RuntimeSnapshot, ShutdownReceipt, UnloadReceipt, UnloadStatus,
+    CleanupFailureReport, DecodeReceipt, FailureClass, LoadReceipt, MemoryKind, ModelSnapshot,
+    PrefillReceipt, RequestStartReceipt, RuntimeError, RuntimeLimits, RuntimeOperation,
+    RuntimeSnapshot, ShutdownReceipt, UnloadReceipt, UnloadStatus,
 };
 
 /// Synchronous inference registry with exclusive ownership of every loaded model.
@@ -24,11 +25,15 @@ where
     loader: L,
     limits: RuntimeLimits,
     models: BTreeMap<ModelId, ModelSlot<L::Model>>,
+    pending_models: BTreeMap<ModelId, PendingModel<L::Model>>,
     request_index: BTreeMap<RequestId, ModelId>,
     sequence_index: BTreeMap<SequenceId, RequestId>,
+    pending_request_index: BTreeMap<RequestId, ModelId>,
+    pending_sequence_index: BTreeMap<SequenceId, RequestId>,
     generations: BTreeMap<ModelId, ModelGeneration>,
     reserved_footprint: MemoryFootprint,
     active_requests: u32,
+    pending_cleanup_sequences: u32,
     shutting_down: bool,
 }
 
@@ -43,7 +48,31 @@ where
     model_footprint: MemoryFootprint,
     reserved_footprint: MemoryFootprint,
     requests: BTreeMap<RequestId, RequestSlot<M::Sequence>>,
+    pending_sequences: BTreeMap<RequestId, PendingSequence<M::Sequence>>,
+    poisoned: bool,
     cancelled_requests_during_unload: u32,
+}
+
+struct PendingModel<M>
+where
+    M: LoadedModel,
+{
+    model: M,
+    footprint: MemoryFootprint,
+    failure: CleanupFailureReport,
+    attempts: u32,
+}
+
+struct PendingSequence<S>
+where
+    S: BackendSequence,
+{
+    request_id: RequestId,
+    sequence_id: SequenceId,
+    sequence: S,
+    footprint: MemoryFootprint,
+    failure: CleanupFailureReport,
+    attempts: u32,
 }
 
 struct RequestSlot<S>
@@ -66,11 +95,15 @@ where
             loader,
             limits,
             models: BTreeMap::new(),
+            pending_models: BTreeMap::new(),
             request_index: BTreeMap::new(),
             sequence_index: BTreeMap::new(),
+            pending_request_index: BTreeMap::new(),
+            pending_sequence_index: BTreeMap::new(),
             generations: BTreeMap::new(),
             reserved_footprint: MemoryFootprint::default(),
             active_requests: 0,
+            pending_cleanup_sequences: 0,
             shutting_down: false,
         }
     }
@@ -82,6 +115,8 @@ where
             loaded_models: saturating_u32(self.models.len()),
             active_requests: self.active_requests,
             reserved_footprint: self.reserved_footprint,
+            pending_cleanup_models: saturating_u32(self.pending_models.len()),
+            pending_cleanup_sequences: self.pending_cleanup_sequences,
             shutting_down: self.shutting_down,
         }
     }
@@ -103,6 +138,8 @@ where
                 descriptor: slot.descriptor,
                 reserved_footprint: slot.reserved_footprint,
                 active_requests: saturating_u32(slot.requests.len()),
+                pending_cleanup_sequences: saturating_u32(slot.pending_sequences.len()),
+                degraded: slot.poisoned,
             })
             .collect()
     }
@@ -122,12 +159,17 @@ where
         device_kind: DeviceKind,
     ) -> Result<LoadReceipt, RuntimeError> {
         self.reject_if_shutting_down()?;
-        if self.models.contains_key(&model_id) {
+        if self.models.contains_key(&model_id) || self.pending_models.contains_key(&model_id) {
             return Err(RuntimeError::ModelAlreadyLoaded(model_id));
         }
-        if self.models.len() >= self.limits.maximum_loaded_models.get() as usize {
+        if self.models.len().saturating_add(self.pending_models.len())
+            >= self.limits.maximum_loaded_models.get() as usize
+        {
             return Err(RuntimeError::LoadedModelLimit {
-                required: saturating_u32(self.models.len()).saturating_add(1),
+                required: saturating_u32(
+                    self.models.len().saturating_add(self.pending_models.len()),
+                )
+                .saturating_add(1),
                 available: self.limits.maximum_loaded_models.get(),
             });
         }
@@ -155,8 +197,26 @@ where
             } else {
                 lifecycle.complete_load().map(|_| ()).map_err(Into::into)
             };
-        if let Err(error) = validation {
-            return Err(rollback_model_load(&mut model, error));
+        if let Err(primary) = validation {
+            if let Err(cleanup) = model.prepare_unload() {
+                let report = CleanupFailureReport::new(
+                    RuntimeOperation::ModelAdmission,
+                    primary.failure_class(),
+                    RuntimeOperation::ModelUnload,
+                    RuntimeError::Synchronization(cleanup).failure_class(),
+                );
+                let pending = PendingModel {
+                    model,
+                    footprint: plan.expected_footprint,
+                    failure: report,
+                    attempts: 1,
+                };
+                self.pending_models.insert(model_id, pending);
+                self.generations.insert(model_id, handle.generation);
+                self.reserved_footprint = next_reserved;
+                return Err(RuntimeError::CleanupFailed(report));
+            }
+            return Err(primary);
         }
 
         let slot = ModelSlot {
@@ -167,6 +227,8 @@ where
             model_footprint: plan.expected_footprint,
             reserved_footprint: plan.expected_footprint,
             requests: BTreeMap::new(),
+            pending_sequences: BTreeMap::new(),
+            poisoned: false,
             cancelled_requests_during_unload: 0,
         };
         let replaced = self.models.insert(model_id, slot);
@@ -188,6 +250,10 @@ where
     /// Returns an error if shutdown has started; a request or sequence identity is
     /// already active; a runtime, model, or memory capacity is exceeded; the model
     /// handle or lifecycle is invalid; or the backend cannot plan or create the sequence.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequence admission keeps prepare, validate, quarantine, and commit in one auditable transaction"
+    )]
     pub fn start_request(
         &mut self,
         handle: ModelHandle,
@@ -196,16 +262,28 @@ where
         configuration: SequenceConfiguration,
     ) -> Result<RequestStartReceipt, RuntimeError> {
         self.reject_if_shutting_down()?;
-        if self.request_index.contains_key(&request_id) {
+        if self.request_index.contains_key(&request_id)
+            || self.pending_request_index.contains_key(&request_id)
+        {
             return Err(RuntimeError::RequestAlreadyActive(request_id));
         }
-        if self.sequence_index.contains_key(&sequence_id) {
+        if self.sequence_index.contains_key(&sequence_id)
+            || self.pending_sequence_index.contains_key(&sequence_id)
+        {
             return Err(RuntimeError::SequenceAlreadyActive(sequence_id));
         }
-        if self.active_requests >= self.limits.maximum_active_requests.get() {
+        if self
+            .active_requests
+            .saturating_add(self.pending_cleanup_sequences)
+            >= self.limits.maximum_active_requests.get()
+        {
             return Err(RuntimeError::CapacityExhausted(CapacityExhausted::new(
                 CapacityResource::ActiveRequests,
-                u64::from(self.active_requests).saturating_add(1),
+                u64::from(
+                    self.active_requests
+                        .saturating_add(self.pending_cleanup_sequences),
+                )
+                .saturating_add(1),
                 u64::from(self.limits.maximum_active_requests.get()),
             )));
         }
@@ -217,6 +295,9 @@ where
             .checked_add(1)
             .ok_or(RuntimeError::BackendContractViolation)?;
         let slot = self.exact_model_mut(handle)?;
+        if slot.poisoned {
+            return Err(RuntimeError::ModelDegraded(handle.id));
+        }
         match slot.lifecycle.state() {
             ModelLifecycleState::Ready | ModelLifecycleState::Active { .. } => {}
             _ => {
@@ -228,10 +309,20 @@ where
         if slot.requests.contains_key(&request_id) {
             return Err(RuntimeError::RequestAlreadyActive(request_id));
         }
-        if slot.requests.len() >= slot.descriptor.capabilities.maximum_sequences as usize {
+        if slot
+            .requests
+            .len()
+            .saturating_add(slot.pending_sequences.len())
+            >= slot.descriptor.capabilities.maximum_sequences as usize
+        {
             return Err(RuntimeError::CapacityExhausted(CapacityExhausted::new(
                 CapacityResource::ActiveSequences,
-                saturating_u64(slot.requests.len()).saturating_add(1),
+                saturating_u64(
+                    slot.requests
+                        .len()
+                        .saturating_add(slot.pending_sequences.len()),
+                )
+                .saturating_add(1),
                 u64::from(slot.descriptor.capabilities.maximum_sequences),
             )));
         }
@@ -248,18 +339,70 @@ where
             checked_add_footprint(slot.reserved_footprint, plan.expected_footprint)?;
         let mut sequence = slot.model.create_sequence(sequence_id, &configuration)?;
         if sequence.id() != sequence_id || sequence.token_capacity() != expected_token_capacity {
-            return Err(rollback_sequence_start(
-                &mut slot.model,
-                &mut sequence,
-                RuntimeError::BackendContractViolation,
-            ));
+            let primary = RuntimeError::BackendContractViolation;
+            if let Err(cleanup) = slot.model.destroy_sequence(&mut sequence) {
+                let report = CleanupFailureReport::new(
+                    RuntimeOperation::SequenceAdmission,
+                    primary.failure_class(),
+                    RuntimeOperation::SequenceDestruction,
+                    RuntimeError::Sequence(cleanup).failure_class(),
+                );
+                slot.pending_sequences.insert(
+                    request_id,
+                    PendingSequence {
+                        request_id,
+                        sequence_id,
+                        sequence,
+                        footprint: plan.expected_footprint,
+                        failure: report,
+                        attempts: 1,
+                    },
+                );
+                slot.reserved_footprint = next_slot_reserved;
+                slot.poisoned = true;
+                self.pending_request_index.insert(request_id, handle.id);
+                self.pending_sequence_index.insert(sequence_id, request_id);
+                self.pending_cleanup_sequences = self
+                    .pending_cleanup_sequences
+                    .checked_add(1)
+                    .ok_or(RuntimeError::BackendContractViolation)?;
+                self.reserved_footprint = next_reserved;
+                return Err(RuntimeError::CleanupFailed(report));
+            }
+            return Err(primary);
         }
         if let Err(error) = slot.lifecycle.start_request() {
-            return Err(rollback_sequence_start(
-                &mut slot.model,
-                &mut sequence,
-                error.into(),
-            ));
+            let primary = RuntimeError::Lifecycle(error);
+            if let Err(cleanup) = slot.model.destroy_sequence(&mut sequence) {
+                let report = CleanupFailureReport::new(
+                    RuntimeOperation::SequenceAdmission,
+                    primary.failure_class(),
+                    RuntimeOperation::SequenceDestruction,
+                    RuntimeError::Sequence(cleanup).failure_class(),
+                );
+                slot.pending_sequences.insert(
+                    request_id,
+                    PendingSequence {
+                        request_id,
+                        sequence_id,
+                        sequence,
+                        footprint: plan.expected_footprint,
+                        failure: report,
+                        attempts: 1,
+                    },
+                );
+                slot.reserved_footprint = next_slot_reserved;
+                slot.poisoned = true;
+                self.pending_request_index.insert(request_id, handle.id);
+                self.pending_sequence_index.insert(sequence_id, request_id);
+                self.pending_cleanup_sequences = self
+                    .pending_cleanup_sequences
+                    .checked_add(1)
+                    .ok_or(RuntimeError::BackendContractViolation)?;
+                self.reserved_footprint = next_reserved;
+                return Err(RuntimeError::CleanupFailed(report));
+            }
+            return Err(primary);
         }
 
         let request = RequestSlot {
@@ -345,14 +488,23 @@ where
 
         match operation {
             Ok((outcome, usage)) => {
-                if matches!(outcome, PrefillOutcome::Finished(_)) {
-                    self.remove_request(request_id)?;
+                if let PrefillOutcome::Finished(reason) = outcome {
+                    self.remove_request(
+                        request_id,
+                        finish_operation(reason),
+                        finish_failure_class(reason),
+                    )?;
                 }
                 Ok(PrefillReceipt { outcome, usage })
             }
             Err(error) => {
-                self.remove_request(request_id)?;
-                Err(RuntimeError::Sequence(error))
+                let primary = RuntimeError::Sequence(error);
+                self.remove_request(
+                    request_id,
+                    RuntimeOperation::Prefill,
+                    primary.failure_class(),
+                )?;
+                Err(primary)
             }
         }
     }
@@ -411,14 +563,23 @@ where
 
         match operation {
             Ok((outcome, usage)) => {
-                if matches!(outcome, DecodeOutcome::Finished(_)) {
-                    self.remove_request(request_id)?;
+                if let DecodeOutcome::Finished(reason) = outcome {
+                    self.remove_request(
+                        request_id,
+                        finish_operation(reason),
+                        finish_failure_class(reason),
+                    )?;
                 }
                 Ok(DecodeReceipt { outcome, usage })
             }
             Err(error) => {
-                self.remove_request(request_id)?;
-                Err(RuntimeError::Sequence(error))
+                let primary = RuntimeError::Sequence(error);
+                self.remove_request(
+                    request_id,
+                    RuntimeOperation::Decode,
+                    primary.failure_class(),
+                )?;
+                Err(primary)
             }
         }
     }
@@ -434,7 +595,11 @@ where
         request_id: RequestId,
         reason: FinishReason,
     ) -> Result<FinishReason, RuntimeError> {
-        self.remove_request(request_id)?;
+        self.remove_request(
+            request_id,
+            finish_operation(reason),
+            finish_failure_class(reason),
+        )?;
         Ok(reason)
     }
 
@@ -449,8 +614,65 @@ where
         request_id: RequestId,
         reason: CancellationReason,
     ) -> Result<FinishReason, RuntimeError> {
-        self.remove_request(request_id)?;
+        self.remove_request(
+            request_id,
+            RuntimeOperation::Cancellation,
+            FailureClass::Cancellation,
+        )?;
         Ok(FinishReason::Cancelled(reason))
+    }
+
+    /// Cleans a request after a generation-kernel failure while preserving its class.
+    ///
+    /// # Errors
+    ///
+    /// Returns the cleanup failure report when explicit sequence destruction fails.
+    pub fn fail_request(
+        &mut self,
+        request_id: RequestId,
+        operation: RuntimeOperation,
+        failure: FailureClass,
+    ) -> Result<(), RuntimeError> {
+        self.remove_request(request_id, operation, failure)
+    }
+
+    /// Returns whether a request still owns a normally active sequence.
+    #[must_use]
+    pub fn is_request_active(&self, request_id: RequestId) -> bool {
+        self.request_index.contains_key(&request_id)
+    }
+
+    /// Returns whether a terminal request still owns quarantined cleanup state.
+    #[must_use]
+    pub fn is_request_cleanup_pending(&self, request_id: RequestId) -> bool {
+        self.pending_request_index.contains_key(&request_id)
+    }
+
+    /// Returns the retained two-failure report for one quarantined request.
+    #[must_use]
+    pub fn request_cleanup_failure(&self, request_id: RequestId) -> Option<CleanupFailureReport> {
+        let model_id = self.pending_request_index.get(&request_id)?;
+        self.models
+            .get(model_id)?
+            .pending_sequences
+            .get(&request_id)
+            .map(|pending| pending.failure)
+    }
+
+    /// Returns one exact resident model snapshot for cold generation admission.
+    #[must_use]
+    pub fn model_snapshot(&self, handle: ModelHandle) -> Option<ModelSnapshot> {
+        self.models.get(&handle.id).and_then(|slot| {
+            (slot.handle == handle).then_some(ModelSnapshot {
+                handle: slot.handle,
+                lifecycle: slot.lifecycle.state(),
+                descriptor: slot.descriptor,
+                reserved_footprint: slot.reserved_footprint,
+                active_requests: saturating_u32(slot.requests.len()),
+                pending_cleanup_sequences: saturating_u32(slot.pending_sequences.len()),
+                degraded: slot.poisoned,
+            })
+        })
     }
 
     /// Applies one explicit unload policy.
@@ -482,7 +704,9 @@ where
             }),
             LifecycleAction::CancelActive { .. } => {
                 let cancelled_requests = self.cancel_all_requests(handle.id)?;
-                self.release_model(handle.id)?;
+                if self.models.contains_key(&handle.id) {
+                    self.release_model(handle.id)?;
+                }
                 Ok(UnloadReceipt {
                     handle,
                     status: UnloadStatus::Unloaded,
@@ -503,6 +727,93 @@ where
                 cancelled_requests: 0,
             }),
         }
+    }
+
+    /// Retries at most one quarantined cleanup operation.
+    ///
+    /// A failed retry retains ownership and accounting and returns the original
+    /// structured primary/cleanup classification again. Callers choose the cadence;
+    /// this method never busy-loops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::CleanupFailed`] when the bounded retry fails, or an
+    /// invariant error when retained accounting cannot be released after success.
+    pub fn poll_cleanup(&mut self) -> Result<bool, RuntimeError> {
+        let pending_sequence = self.models.iter().find_map(|(model_id, slot)| {
+            slot.pending_sequences
+                .first_key_value()
+                .map(|(request_id, _)| (*model_id, *request_id))
+        });
+        if let Some((model_id, request_id)) = pending_sequence {
+            let retry = {
+                let slot = self
+                    .models
+                    .get_mut(&model_id)
+                    .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+                let pending = slot
+                    .pending_sequences
+                    .get_mut(&request_id)
+                    .ok_or(RuntimeError::BackendContractViolation)?;
+                pending.attempts = pending.attempts.saturating_add(1);
+                match slot.model.destroy_sequence(&mut pending.sequence) {
+                    Ok(()) => Ok((
+                        pending.sequence_id,
+                        pending.footprint,
+                        slot.lifecycle.state(),
+                    )),
+                    Err(_) => Err(pending.failure),
+                }
+            };
+            let (sequence_id, footprint, lifecycle) = match retry {
+                Ok(released) => released,
+                Err(report) => return Err(RuntimeError::CleanupFailed(report)),
+            };
+            let slot = self
+                .models
+                .get_mut(&model_id)
+                .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+            let removed = slot
+                .pending_sequences
+                .remove(&request_id)
+                .ok_or(RuntimeError::BackendContractViolation)?;
+            debug_assert_eq!(removed.request_id, request_id);
+            slot.reserved_footprint = checked_sub_footprint(slot.reserved_footprint, footprint)?;
+            slot.poisoned = !slot.pending_sequences.is_empty();
+            self.pending_request_index.remove(&request_id);
+            self.pending_sequence_index.remove(&sequence_id);
+            self.pending_cleanup_sequences = self
+                .pending_cleanup_sequences
+                .checked_sub(1)
+                .ok_or(RuntimeError::BackendContractViolation)?;
+            self.reserved_footprint = checked_sub_footprint(self.reserved_footprint, footprint)?;
+            if lifecycle == ModelLifecycleState::Unloading {
+                self.release_model(model_id)?;
+            }
+            return Ok(true);
+        }
+
+        let Some(model_id) = self.pending_models.first_key_value().map(|(id, _)| *id) else {
+            return Ok(false);
+        };
+        let retry = {
+            let pending = self
+                .pending_models
+                .get_mut(&model_id)
+                .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+            pending.attempts = pending.attempts.saturating_add(1);
+            pending.model.prepare_unload().map_err(|_| pending.failure)
+        };
+        if let Err(report) = retry {
+            return Err(RuntimeError::CleanupFailed(report));
+        }
+        let pending = self
+            .pending_models
+            .remove(&model_id)
+            .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+        self.reserved_footprint =
+            checked_sub_footprint(self.reserved_footprint, pending.footprint)?;
+        Ok(true)
     }
 
     /// Enforces at most one timeout-driven or pending-unload transition.
@@ -546,7 +857,9 @@ where
             let result = self
                 .cancel_all_requests(model_id)
                 .and_then(|cancelled_requests| {
-                    self.release_model(model_id)?;
+                    if self.models.contains_key(&model_id) {
+                        self.release_model(model_id)?;
+                    }
                     Ok(UnloadReceipt {
                         handle,
                         status: UnloadStatus::Unloaded,
@@ -570,7 +883,9 @@ where
             let result = self
                 .cancel_all_requests(model_id)
                 .and_then(|cancelled_requests| {
-                    self.release_model(model_id)?;
+                    if self.models.contains_key(&model_id) {
+                        self.release_model(model_id)?;
+                    }
                     Ok(UnloadReceipt {
                         handle,
                         status: UnloadStatus::Unloaded,
@@ -607,6 +922,9 @@ where
     /// or model resources violates runtime accounting invariants.
     pub fn shutdown(&mut self) -> Result<ShutdownReceipt, RuntimeError> {
         self.shutting_down = true;
+        while self.pending_cleanup_sequences > 0 || !self.pending_models.is_empty() {
+            self.poll_cleanup()?;
+        }
         let mut unloaded_models = 0_u32;
         let mut cancelled_requests = 0_u32;
 
@@ -650,7 +968,9 @@ where
                     ));
                 }
             }
-            self.release_model(model_id)?;
+            if self.models.contains_key(&model_id) {
+                self.release_model(model_id)?;
+            }
             unloaded_models = unloaded_models.saturating_add(1);
         }
 
@@ -703,22 +1023,83 @@ where
             .ok_or(RuntimeError::RequestNotActive(request_id))
     }
 
-    fn remove_request(&mut self, request_id: RequestId) -> Result<(), RuntimeError> {
+    fn remove_request(
+        &mut self,
+        request_id: RequestId,
+        primary_operation: RuntimeOperation,
+        primary_failure: FailureClass,
+    ) -> Result<(), RuntimeError> {
         let model_id = self.request_model_id(request_id)?;
+        let cleanup_failure = {
+            let slot = self
+                .models
+                .get_mut(&model_id)
+                .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+            let request = slot
+                .requests
+                .get_mut(&request_id)
+                .ok_or(RuntimeError::RequestNotActive(request_id))?;
+            slot.model.destroy_sequence(&mut request.sequence).err()
+        };
+
+        if let Some(cleanup) = cleanup_failure {
+            let report = CleanupFailureReport::new(
+                primary_operation,
+                primary_failure,
+                RuntimeOperation::SequenceDestruction,
+                RuntimeError::Sequence(cleanup).failure_class(),
+            );
+            let (sequence_id, action) = {
+                let slot = self
+                    .models
+                    .get_mut(&model_id)
+                    .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+                let request = slot
+                    .requests
+                    .remove(&request_id)
+                    .ok_or(RuntimeError::BackendContractViolation)?;
+                let sequence_id = request.sequence.id();
+                let pending = PendingSequence {
+                    request_id,
+                    sequence_id,
+                    sequence: request.sequence,
+                    footprint: request.footprint,
+                    failure: report,
+                    attempts: 1,
+                };
+                slot.pending_sequences.insert(request_id, pending);
+                slot.poisoned = true;
+                let action = slot.lifecycle.finish_request()?;
+                (sequence_id, action)
+            };
+            self.request_index.remove(&request_id);
+            self.sequence_index.remove(&sequence_id);
+            self.pending_request_index.insert(request_id, model_id);
+            self.pending_sequence_index.insert(sequence_id, request_id);
+            self.active_requests = self
+                .active_requests
+                .checked_sub(1)
+                .ok_or(RuntimeError::BackendContractViolation)?;
+            self.pending_cleanup_sequences = self
+                .pending_cleanup_sequences
+                .checked_add(1)
+                .ok_or(RuntimeError::BackendContractViolation)?;
+            if action == LifecycleAction::ReleaseModel {
+                debug_assert_eq!(
+                    self.models
+                        .get(&model_id)
+                        .map(|slot| slot.lifecycle.state()),
+                    Some(ModelLifecycleState::Unloading)
+                );
+            }
+            return Err(RuntimeError::CleanupFailed(report));
+        }
+
         let (sequence_id, footprint, action) = {
             let slot = self
                 .models
                 .get_mut(&model_id)
                 .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
-            {
-                let request = slot
-                    .requests
-                    .get_mut(&request_id)
-                    .ok_or(RuntimeError::RequestNotActive(request_id))?;
-                slot.model
-                    .destroy_sequence(&mut request.sequence)
-                    .map_err(RuntimeError::Sequence)?;
-            }
             let request = slot
                 .requests
                 .remove(&request_id)
@@ -744,59 +1125,44 @@ where
     }
 
     fn cancel_all_requests(&mut self, model_id: ModelId) -> Result<u32, RuntimeError> {
-        loop {
-            let removal = {
-                let slot = self
-                    .models
-                    .get_mut(&model_id)
-                    .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
-                let Some(request_id) = slot
-                    .requests
-                    .first_key_value()
-                    .map(|(request_id, _)| *request_id)
-                else {
-                    break;
-                };
-                {
-                    let request = slot
-                        .requests
-                        .get_mut(&request_id)
-                        .ok_or(RuntimeError::BackendContractViolation)?;
-                    slot.model
-                        .destroy_sequence(&mut request.sequence)
-                        .map_err(RuntimeError::Sequence)?;
-                }
-                let request = slot
-                    .requests
-                    .remove(&request_id)
-                    .ok_or(RuntimeError::BackendContractViolation)?;
-                let sequence_id = request.sequence.id();
-                let footprint = request.footprint;
-                slot.reserved_footprint =
-                    checked_sub_footprint(slot.reserved_footprint, footprint)?;
-                slot.lifecycle.finish_request()?;
-                (request_id, sequence_id, footprint)
-            };
-
-            let (request_id, sequence_id, footprint) = removal;
-            self.request_index.remove(&request_id);
-            self.sequence_index.remove(&sequence_id);
-            self.active_requests = self
-                .active_requests
-                .checked_sub(1)
-                .ok_or(RuntimeError::BackendContractViolation)?;
-            self.reserved_footprint = checked_sub_footprint(self.reserved_footprint, footprint)?;
-            let slot = self
-                .models
-                .get_mut(&model_id)
-                .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
-            slot.cancelled_requests_during_unload =
-                slot.cancelled_requests_during_unload.saturating_add(1);
-        }
-        self.models
+        let mut cancelled = self
+            .models
             .get(&model_id)
             .map(|slot| slot.cancelled_requests_during_unload)
-            .ok_or(RuntimeError::ModelNotLoaded(model_id))
+            .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
+        loop {
+            let request_id = self.models.get(&model_id).and_then(|slot| {
+                slot.requests
+                    .first_key_value()
+                    .map(|(request_id, _)| *request_id)
+            });
+            let Some(request_id) = request_id else {
+                break;
+            };
+            match self.remove_request(
+                request_id,
+                RuntimeOperation::Cancellation,
+                FailureClass::Cancellation,
+            ) {
+                Ok(()) => {
+                    cancelled = cancelled.saturating_add(1);
+                    if let Some(slot) = self.models.get_mut(&model_id) {
+                        slot.cancelled_requests_during_unload = cancelled;
+                    } else {
+                        break;
+                    }
+                }
+                Err(error @ RuntimeError::CleanupFailed(_)) => {
+                    cancelled = cancelled.saturating_add(1);
+                    if let Some(slot) = self.models.get_mut(&model_id) {
+                        slot.cancelled_requests_during_unload = cancelled;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(cancelled)
     }
 
     fn release_model(&mut self, model_id: ModelId) -> Result<(), RuntimeError> {
@@ -805,13 +1171,18 @@ where
                 .models
                 .get_mut(&model_id)
                 .ok_or(RuntimeError::ModelNotLoaded(model_id))?;
-            if !slot.requests.is_empty() || slot.lifecycle.state() != ModelLifecycleState::Unloading
+            if !slot.requests.is_empty()
+                || !slot.pending_sequences.is_empty()
+                || slot.lifecycle.state() != ModelLifecycleState::Unloading
             {
                 return Err(RuntimeError::Lifecycle(
                     domain_contracts::LifecycleError::InvalidTransition,
                 ));
             }
-            slot.model.prepare_unload()?;
+            if let Err(error) = slot.model.prepare_unload() {
+                slot.poisoned = true;
+                return Err(RuntimeError::Synchronization(error));
+            }
             slot.lifecycle.complete_unload()?;
         }
         let slot = self
@@ -842,27 +1213,22 @@ where
     }
 }
 
-fn rollback_model_load<M>(model: &mut M, cause: RuntimeError) -> RuntimeError
-where
-    M: LoadedModel,
-{
-    match model.prepare_unload() {
-        Ok(()) => cause,
-        Err(error) => RuntimeError::Synchronization(error),
+const fn finish_operation(reason: FinishReason) -> RuntimeOperation {
+    if matches!(reason, FinishReason::Cancelled(_)) {
+        RuntimeOperation::Cancellation
+    } else {
+        RuntimeOperation::Completion
     }
 }
 
-fn rollback_sequence_start<M>(
-    model: &mut M,
-    sequence: &mut M::Sequence,
-    cause: RuntimeError,
-) -> RuntimeError
-where
-    M: LoadedModel,
-{
-    match model.destroy_sequence(sequence) {
-        Ok(()) => cause,
-        Err(error) => RuntimeError::Sequence(error),
+const fn finish_failure_class(reason: FinishReason) -> FailureClass {
+    match reason {
+        FinishReason::Cancelled(_) => FailureClass::Cancellation,
+        FinishReason::BufferExhausted(_) => FailureClass::Capacity,
+        FinishReason::EndOfSequence(_) | FinishReason::TokenLimit | FinishReason::StopCondition => {
+            FailureClass::Completion
+        }
+        _ => FailureClass::Completion,
     }
 }
 

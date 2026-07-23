@@ -6,6 +6,15 @@ use std::time::Duration;
 use domain_contracts::MemoryBudget;
 use host_runtime::ChannelCapacity;
 
+const DEFAULT_TOKEN_OUTPUT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(256) {
+    Some(value) => value,
+    None => NonZeroUsize::MIN,
+};
+const DEFAULT_TOKEN_OUTPUT_RECORD_CAPACITY: NonZeroUsize = match NonZeroUsize::new(512) {
+    Some(value) => value,
+    None => NonZeroUsize::MIN,
+};
+
 /// Hard model, request, and aggregate memory bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeLimits {
@@ -40,6 +49,10 @@ pub struct HostedRuntimeConfiguration {
     pub command_capacity: ChannelCapacity,
     /// Maximum queued runtime events.
     pub event_capacity: ChannelCapacity,
+    /// Maximum unpublished token identifiers in the pull accumulator.
+    pub token_output_capacity: NonZeroUsize,
+    /// Maximum unpublished token/state records in the pull accumulator.
+    pub token_output_record_capacity: NonZeroUsize,
     poll_interval_milliseconds: NonZeroU64,
 }
 
@@ -54,8 +67,22 @@ impl HostedRuntimeConfiguration {
         Self {
             command_capacity: ChannelCapacity::new(command_capacity),
             event_capacity: ChannelCapacity::new(event_capacity),
+            token_output_capacity: DEFAULT_TOKEN_OUTPUT_CAPACITY,
+            token_output_record_capacity: DEFAULT_TOKEN_OUTPUT_RECORD_CAPACITY,
             poll_interval_milliseconds,
         }
+    }
+
+    /// Overrides pull-oriented token and state capacities.
+    #[must_use]
+    pub const fn with_token_output_capacity(
+        mut self,
+        tokens: NonZeroUsize,
+        records: NonZeroUsize,
+    ) -> Self {
+        self.token_output_capacity = tokens;
+        self.token_output_record_capacity = records;
+        self
     }
 
     /// Returns the lifecycle polling and bounded-send interval.

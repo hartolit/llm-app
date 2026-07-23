@@ -340,6 +340,8 @@ impl ApplicationRuntime {
             RuntimeEvent::ModelLoaded { result, .. } => Some(self.process_model_loaded(*result)),
             RuntimeEvent::ModelUnload { result, .. } => Some(self.process_model_unload(*result)),
             RuntimeEvent::Shutdown { .. }
+            | RuntimeEvent::GenerationAdmitted { .. }
+            | RuntimeEvent::GenerationCancellationRequested { .. }
             | RuntimeEvent::RequestStarted { .. }
             | RuntimeEvent::PrefillCompleted { .. }
             | RuntimeEvent::DecodeCompleted { .. }

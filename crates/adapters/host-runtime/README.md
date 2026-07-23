@@ -6,7 +6,10 @@ It quarantines Flume, `std::thread`, `Instant`, and the short-lived synchronizat
 used by frame-pull output batching. Engine crates receive stable wrapper types
 rather than importing Flume directly.
 
-The output accumulator allocates its byte and record storage once during setup.
-Inference producers use non-blocking `try_lock`, validate both capacities before
-mutation, and never resize the buffers. A UI consumer pulls and clears one
-borrowed batch on its native frame clock while retaining the allocations.
+The text output accumulator allocates its byte and record storage once during
+setup. The separate generic token accumulator preallocates token IDs and ordered
+request/state records, exposes absolute monotonic token ranges, and accepts a
+`Copy` state payload defined by the inference engine. Inference producers use
+non-blocking `try_lock`, validate all capacities before mutation, and never resize
+the buffers. An application consumer pulls and clears one borrowed batch on its
+own cadence while retaining the allocations for reuse.

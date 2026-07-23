@@ -2,9 +2,9 @@
 
 **Status date:** 2026-07-23
 
-**Source baseline:** uncommitted Phase 2 working tree based on commit `1c84b28d8052e66c515c0974cfd959351fc62e0b`
+**Source baseline:** uncommitted Phase 3 working tree based on commit `1289f1242fd1bf31ed8d9b235e2bb090218f5666`
 
-**Execution position:** Phase 2 transactional runtime safety implemented and validated locally; Phase 3 has not started
+**Execution position:** Phase 3 backend-independent generation kernel implemented; Phase 4 real Candle generation has not started
 
 **Canonical plan:** [LLM App Execution Plan](../execution/execution-plan.md)
 
@@ -31,14 +31,16 @@ The GGUF adapter supports the backend contracts and compile/test compatibility a
 | Model load, generation-safe handle, drain, cancellation, unload | Yes | Yes for Candle | Yes for Candle |
 | Hugging Face resolve/tokenizer validation/persistence | N/A | Yes | Yes |
 | Backend prefill and decode primitives | Yes | Not exposed as generation | No |
-| Sampling algorithm | Separate feature crate | Not integrated | No |
+| Backend-independent generation scheduler | Yes, deterministic fake backend | Not exposed | No |
+| Sampling algorithm | Integrated inside E0 generation | Not exposed | No |
 | Context planning | Separate feature crate | Not integrated | No |
 | Direct-completion prompt-to-stream loop | No | No | No |
 | General chat templates/history | No | No | No |
-| Bounded streamed text output | Transport primitives only | No | No |
+| Bounded streamed token output | Yes, pull-oriented token/state batches | No | No |
+| Bounded streamed text output | Transport primitive only | No | No |
 | Corrective workflow graph | N/A | Yes, separately composable | No product surface |
 
-No current user-facing path performs prompt → tokenize → context admission → prefill → sample → incremental decode → bounded text streaming. Direct completion is the first planned generation mode. General chat support follows only after that loop is proven.
+E0 now performs already-tokenized prompt → prefill → sample → incremental decode → bounded token streaming with deterministic fake models. No current user-facing path supplies tokenization, decoded text, context planning, or generation controls. Direct completion through Candle is the next planned vertical slice; general chat support follows later.
 
 ## Implemented foundations
 
@@ -46,6 +48,9 @@ No current user-facing path performs prompt → tokenize → context admission �
 - Candle CPU and GGUF CPU adapters with backend contract tests.
 - Exclusive-owner inference runtime with bounded hosted transport, lifecycle state, memory admission, cancellation, draining, and unload.
 - Prepare/validate/commit model-load and request-start transactions with explicit native rollback and deterministic fault-injection coverage.
+- Quarantined model/sequence ownership after failed cleanup, structured primary-plus-cleanup failure reports, retained capacity/memory accounting, degraded-model admission rejection, and bounded maintenance retry.
+- Worker-owned prefill/decode/sample scheduling with preallocated request workspaces, bounded fairness, cancellation boundaries, EOS/token-limit/token-stop handling, and pull-oriented token backpressure.
+- Deterministic fake-backend generation tests requiring no model download, covering greedy and seeded sampling, stop conditions, cancellation, backend failure, cleanup failure/retry, and duplicate-cleanup counters.
 - Frontend-neutral application façade for Hugging Face resolution, tokenizer validation, redb persistence, Candle model lifecycle, normalized events, and corrective workflows.
 - Checked bounded shutdown deadlines, explicit Slint close-path shutdown, and deterministic disconnection, timeout, join-failure, cancellation, and unload-failure tests.
 - Thin Slint lifecycle frontend.
@@ -57,7 +62,7 @@ Component details are indexed by the [documentation map](../README.md).
 
 ## Reproducible validation evidence
 
-Local validation ran on 2026-07-23 from the uncommitted Phase 2 working tree based on commit `1c84b28d8052e66c515c0974cfd959351fc62e0b`. A remote CI run URL cannot exist until the change is pushed; `.github/workflows/quality.yml` is configured to run on every push and pull request.
+Local validation ran on 2026-07-23 from the uncommitted Phase 3 working tree based on commit `1289f1242fd1bf31ed8d9b235e2bb090218f5666`. A remote CI run URL cannot exist until the change is pushed; `.github/workflows/quality.yml` is configured to run on every push and pull request.
 
 Toolchain and installed targets:
 
@@ -89,14 +94,14 @@ lychee --config lychee.toml --offline '**/*.md'
 
 Results:
 
-- 104 ordinary tests passed; zero failed;
+- 114 ordinary tests passed; zero failed;
 - Clippy and rustdoc completed with zero warnings under `-D warnings`;
 - all workspace benchmark targets compiled;
 - both named non-host library target checks passed for all five portable feature crates;
 - the full workspace graph passed `cargo-deny 0.20.2` advisories, dependency bans, licenses, and sources with five documented transitive advisory exceptions;
 - Lychee 0.24.2 checked 72 Markdown links: 62 valid, 10 external/offline exclusions, zero errors;
 - `cargo tree -d --locked` remains an audit report: metadata contains 57 duplicated package names spanning 120 package-version entries; no blanket deduplication is required;
-- the last recorded Phase 1 `desktop-slint` release binary size was 46,540,808 bytes for `x86_64-unknown-linux-gnu` using the default release profile; Phase 2 did not rerun that size measurement.
+- the last recorded Phase 1 `desktop-slint` release binary size was 46,540,808 bytes for `x86_64-unknown-linux-gnu` using the default release profile; Phase 3 did not rerun that size measurement.
 
 No product binary was launched and no real external model was exercised by this quality-gate validation.
 
@@ -106,6 +111,8 @@ No product binary was launched and no real external model was exercised by this 
 - CI currently names Ubuntu 24.04 / `x86_64-unknown-linux-gnu` as the host platform. Windows and macOS jobs remain deferred until native toolchains are documented.
 - Scheduled external-link checks depend on third-party site availability; pull-request link checks intentionally validate repository-local links offline.
 - Explicit bounded shutdown remains a caller obligation for any future non-Slint frontend; blocking `Drop` is intentionally not a fallback.
+- Phase 3 generation begins from caller-supplied token IDs and emits token IDs; tokenizer ownership, incremental text decoding, E1 commands, and frontend pulls remain Phase 5/6 work.
+- Ordinary generation tests use a deterministic fake backend. Real Candle prompt-to-token generation remains Phase 4 and is not claimed here.
 - E1 exposes configuration capacity below it but represents only one loaded model generation.
 - Candle’s upstream cache and GGUF’s native execution do not support a repository-wide allocation-free backend claim.
 - Real-model smoke testing is target-machine work and is not part of the baseline command above.

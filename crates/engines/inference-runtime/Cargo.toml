@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 domain-contracts.workspace = true
 host-runtime.workspace = true
+sampling.workspace = true
 
 [dev-dependencies]
 candle-backend.workspace = true

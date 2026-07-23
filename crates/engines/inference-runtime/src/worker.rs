@@ -1,24 +1,29 @@
 //! Bounded single-thread host wrapper around the synchronous runtime registry.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::error::Error;
+use std::fmt::{self, Display, Formatter};
 use std::time::Duration;
 
 use domain_contracts::{ModelHandle, ModelId, ModelLifecycleState, ModelLoader, MonotonicMillis};
 use host_runtime::{
-    BoundedReceiver, BoundedSender, HostThread, MonotonicClock, ReceiveTimeoutError,
-    SendTimeoutError, ThreadPanicked, ThreadSpawnError, TryReceiveError, TrySendError, bounded,
-    spawn_named,
+    BoundedReceiver, BoundedSender, HostThread, MonotonicClock, OutputPullError,
+    ReceiveTimeoutError, ThreadPanicked, ThreadSpawnError, TokenOutputBatch, TokenOutputConsumer,
+    TokenOutputInitializationError, TokenOutputProducer, TryReceiveError, TrySendError, bounded,
+    spawn_named, token_output_accumulator,
 };
 
+use crate::generation::GenerationScheduler;
 use crate::{
-    CommandTicket, HostedRuntimeConfiguration, InferenceRuntime, RuntimeCommand, RuntimeEvent,
-    RuntimeLimits, RuntimeReceiveError, RuntimeSubmitError,
+    CommandTicket, GenerationOutputState, HostedRuntimeConfiguration, InferenceRuntime,
+    RuntimeCommand, RuntimeEvent, RuntimeLimits, RuntimeReceiveError, RuntimeSubmitError,
 };
 
 /// Client-side bounded command and event endpoints.
 pub struct HostedRuntime<S> {
     commands: BoundedSender<RuntimeCommand<S>>,
     events: BoundedReceiver<RuntimeEvent>,
+    token_output: TokenOutputConsumer<GenerationOutputState>,
 }
 
 impl<S> HostedRuntime<S> {
@@ -27,6 +32,10 @@ impl<S> HostedRuntime<S> {
     /// # Errors
     ///
     /// Returns the command if the bounded queue is full or the worker has disconnected.
+    #[expect(
+        clippy::result_large_err,
+        reason = "bounded submission errors intentionally return ownership of the unsent command"
+    )]
     pub fn try_submit(&self, command: RuntimeCommand<S>) -> Result<(), RuntimeSubmitError<S>> {
         self.commands
             .try_send(command)
@@ -64,6 +73,22 @@ impl<S> HostedRuntime<S> {
             })
     }
 
+    /// Pulls all currently published token ranges and generation state records.
+    ///
+    /// The callback borrows the retained accumulator storage. Copy any values needed
+    /// after it returns; the next worker write may reuse the same allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutputPullError::Poisoned`] after a consumer panic poisons the
+    /// short-lived accumulator mutex.
+    pub fn pull_token_output<R, F>(&self, consume: F) -> Result<R, OutputPullError>
+    where
+        F: for<'batch> FnOnce(TokenOutputBatch<'batch, GenerationOutputState>) -> R,
+    {
+        self.token_output.pull(consume)
+    }
+
     /// Returns the number of currently queued commands.
     #[must_use]
     pub fn queued_commands(&self) -> usize {
@@ -83,6 +108,7 @@ struct PendingUnload {
     handle: ModelHandle,
     ticket: CommandTicket,
     failure_reported: bool,
+    cancelled_requests: u32,
 }
 
 /// Join handle for the exclusively owning runtime worker.
@@ -107,6 +133,34 @@ impl RuntimeThread {
     }
 }
 
+/// Failure to initialize generation output or spawn the runtime worker.
+#[derive(Debug)]
+pub enum HostedRuntimeStartError {
+    /// Cold allocation of the bounded token accumulator failed.
+    TokenOutput(TokenOutputInitializationError),
+    /// Host thread creation failed.
+    Thread(ThreadSpawnError),
+}
+
+impl Display for HostedRuntimeStartError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TokenOutput(error) => {
+                write!(formatter, "token output initialization failed: {error:?}")
+            }
+            Self::Thread(error) => Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl Error for HostedRuntimeStartError {}
+
+impl From<ThreadSpawnError> for HostedRuntimeStartError {
+    fn from(value: ThreadSpawnError) -> Self {
+        Self::Thread(value)
+    }
+}
+
 /// Starts one bounded runtime worker around a concrete loader and model type.
 ///
 /// # Errors
@@ -116,18 +170,25 @@ pub fn start_hosted_runtime<L>(
     loader: L,
     limits: RuntimeLimits,
     configuration: HostedRuntimeConfiguration,
-) -> Result<(HostedRuntime<L::Source>, RuntimeThread), ThreadSpawnError>
+) -> Result<(HostedRuntime<L::Source>, RuntimeThread), HostedRuntimeStartError>
 where
     L: ModelLoader + Send + 'static,
     L::Source: Send + 'static,
 {
     let (command_sender, command_receiver) = bounded(configuration.command_capacity);
     let (event_sender, event_receiver) = bounded(configuration.event_capacity);
+    let (token_output_producer, token_output_consumer) = token_output_accumulator(
+        configuration.token_output_capacity,
+        configuration.token_output_record_capacity,
+    )
+    .map_err(HostedRuntimeStartError::TokenOutput)?;
     let thread = spawn_named("llm-inference-runtime", move || {
         run_worker(
             InferenceRuntime::new(loader, limits),
             &command_receiver,
             &event_sender,
+            &token_output_producer,
+            configuration.event_capacity.get(),
             configuration.poll_interval(),
         );
     })?;
@@ -136,29 +197,51 @@ where
         HostedRuntime {
             commands: command_sender,
             events: event_receiver,
+            token_output: token_output_consumer,
         },
         RuntimeThread { thread },
     ))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the worker loop keeps control, generation, maintenance, and publication ordering explicit"
+)]
 fn run_worker<L>(
     mut runtime: InferenceRuntime<L>,
     commands: &BoundedReceiver<RuntimeCommand<L::Source>>,
     events: &BoundedSender<RuntimeEvent>,
+    token_output: &TokenOutputProducer<GenerationOutputState>,
+    event_backlog_capacity: usize,
     poll_interval: Duration,
 ) where
     L: ModelLoader,
 {
     let clock = MonotonicClock::new();
+    let mut scheduler = GenerationScheduler::new();
     let mut pending_event = None;
+    let mut queued_events = VecDeque::with_capacity(event_backlog_capacity);
     let mut stop_after_event = false;
     let mut pending_unloads = BTreeMap::<ModelId, PendingUnload>::new();
     let mut maintenance_events = BTreeMap::<ModelId, RuntimeEvent>::new();
 
     loop {
+        let _cleanup_result = runtime.poll_cleanup();
         if let Some((model_id, event)) =
             maintenance_event(&mut runtime, clock.now(), &mut pending_unloads)
         {
+            if matches!(
+                event,
+                RuntimeEvent::ModelUnload {
+                    result: Ok(crate::UnloadReceipt { cancelled_requests, .. }),
+                    ..
+                } if cancelled_requests > 0
+            ) {
+                scheduler.request_model_cancellation(
+                    model_id,
+                    domain_contracts::CancellationReason::DrainTimeout,
+                );
+            }
             maintenance_events.insert(model_id, event);
         }
         collect_naturally_completed_unloads(
@@ -167,40 +250,97 @@ fn run_worker<L>(
             &mut maintenance_events,
         );
         if pending_event.is_none() {
-            pending_event = maintenance_events.pop_first().map(|(_, event)| event);
+            pending_event = queued_events
+                .pop_front()
+                .or_else(|| maintenance_events.pop_first().map(|(_, event)| event));
+        }
+
+        if stop_after_event
+            && scheduler.is_empty()
+            && pending_event.is_none()
+            && queued_events.is_empty()
+        {
+            break;
         }
 
         if let Some(event) = pending_event.take() {
-            match events.send_timeout(event, poll_interval) {
+            match events.try_send(event) {
                 Ok(()) => {
-                    if stop_after_event {
+                    if stop_after_event && scheduler.is_empty() {
                         break;
                     }
-                    continue;
                 }
-                Err(SendTimeoutError::Timeout(event)) => {
-                    pending_event = Some(event);
-                    continue;
-                }
-                Err(SendTimeoutError::Disconnected(_)) => {
+                Err(TrySendError::Full(event)) => pending_event = Some(event),
+                Err(TrySendError::Disconnected(_)) => {
                     let _shutdown_result = runtime.shutdown();
                     break;
                 }
             }
         }
 
-        match commands.receive_timeout(poll_interval) {
-            Ok(command) => {
+        if stop_after_event && scheduler.is_empty() {
+            std::thread::sleep(poll_interval);
+            continue;
+        }
+
+        let mut handled_command = false;
+        let can_accept_command = queued_events.len() < event_backlog_capacity;
+        match can_accept_command.then(|| commands.try_receive()) {
+            None | Some(Err(TryReceiveError::Empty)) => {}
+            Some(Ok(command)) => {
+                handled_command = true;
                 let unload_identity = unload_command_identity(&command);
-                let (event, should_stop) = dispatch(&mut runtime, command, clock.now());
+                let (event, should_stop) = dispatch(
+                    &mut runtime,
+                    &mut scheduler,
+                    token_output,
+                    command,
+                    clock.now(),
+                );
                 remember_pending_unload(unload_identity, &event, &runtime, &mut pending_unloads);
-                pending_event = Some(event);
+                if pending_event.is_none() {
+                    pending_event = Some(event);
+                } else {
+                    queued_events.push_back(event);
+                }
                 stop_after_event = should_stop;
             }
-            Err(ReceiveTimeoutError::Timeout) => {}
-            Err(ReceiveTimeoutError::Disconnected) => {
+            Some(Err(TryReceiveError::Disconnected)) => {
                 let _shutdown_result = runtime.shutdown();
                 break;
+            }
+        }
+
+        let advance = scheduler.advance(&mut runtime, token_output);
+        if !handled_command && !advance.progressed && queued_events.len() < event_backlog_capacity {
+            match commands.receive_timeout(poll_interval) {
+                Ok(command) => {
+                    let unload_identity = unload_command_identity(&command);
+                    let (event, should_stop) = dispatch(
+                        &mut runtime,
+                        &mut scheduler,
+                        token_output,
+                        command,
+                        clock.now(),
+                    );
+                    remember_pending_unload(
+                        unload_identity,
+                        &event,
+                        &runtime,
+                        &mut pending_unloads,
+                    );
+                    if pending_event.is_none() {
+                        pending_event = Some(event);
+                    } else {
+                        queued_events.push_back(event);
+                    }
+                    stop_after_event = should_stop;
+                }
+                Err(ReceiveTimeoutError::Timeout) => {}
+                Err(ReceiveTimeoutError::Disconnected) => {
+                    let _shutdown_result = runtime.shutdown();
+                    break;
+                }
             }
         }
     }
@@ -269,7 +409,7 @@ fn collect_naturally_completed_unloads<L>(
                 result: Ok(crate::UnloadReceipt {
                     handle: pending.handle,
                     status: crate::UnloadStatus::Unloaded,
-                    cancelled_requests: 0,
+                    cancelled_requests: pending.cancelled_requests,
                 }),
             },
         );
@@ -309,12 +449,24 @@ fn remember_pending_unload<L>(
         });
     if pending {
         let failure_reported = matches!(event, RuntimeEvent::ModelUnload { result: Err(_), .. });
+        let cancelled_requests = match event {
+            RuntimeEvent::ModelUnload {
+                result: Ok(receipt),
+                ..
+            } => receipt.cancelled_requests,
+            RuntimeEvent::ModelUnload {
+                result: Err(crate::RuntimeError::CleanupFailed(report)),
+                ..
+            } if report.primary_failure == crate::FailureClass::Cancellation => 1,
+            _ => 0,
+        };
         pending_unloads.insert(
             model_id,
             PendingUnload {
                 handle,
                 ticket,
                 failure_reported,
+                cancelled_requests,
             },
         );
     } else {
@@ -322,8 +474,14 @@ fn remember_pending_unload<L>(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "command dispatch is an exhaustive ownership boundary over all runtime commands"
+)]
 fn dispatch<L>(
     runtime: &mut InferenceRuntime<L>,
+    scheduler: &mut GenerationScheduler,
+    _token_output: &TokenOutputProducer<GenerationOutputState>,
     command: RuntimeCommand<L::Source>,
     now: MonotonicMillis,
 ) -> (RuntimeEvent, bool)
@@ -357,6 +515,17 @@ where
             },
             false,
         ),
+        RuntimeCommand::Generate {
+            ticket,
+            handle,
+            request,
+        } => (
+            RuntimeEvent::GenerationAdmitted {
+                ticket,
+                result: scheduler.admit(runtime, handle, request),
+            },
+            false,
+        ),
         RuntimeCommand::Prefill {
             ticket,
             request_id,
@@ -386,6 +555,18 @@ where
             ticket,
             request_id,
             reason,
+        } if scheduler.contains(request_id) => (
+            RuntimeEvent::GenerationCancellationRequested {
+                ticket,
+                request_id,
+                result: scheduler.request_cancellation(request_id, reason),
+            },
+            false,
+        ),
+        RuntimeCommand::CancelRequest {
+            ticket,
+            request_id,
+            reason,
         } => (
             RuntimeEvent::RequestFinished {
                 ticket,
@@ -398,13 +579,21 @@ where
             ticket,
             handle,
             policy,
-        } => (
-            RuntimeEvent::ModelUnload {
-                ticket,
-                result: runtime.unload_model(handle, policy, now),
-            },
-            false,
-        ),
+        } => {
+            if matches!(policy, domain_contracts::UnloadPolicy::CancelActive) {
+                scheduler.request_model_cancellation(
+                    handle.id,
+                    domain_contracts::CancellationReason::ModelUnload,
+                );
+            }
+            (
+                RuntimeEvent::ModelUnload {
+                    ticket,
+                    result: runtime.unload_model(handle, policy, now),
+                },
+                false,
+            )
+        }
         RuntimeCommand::Snapshot { ticket } => (
             RuntimeEvent::Snapshot {
                 ticket,
@@ -414,6 +603,8 @@ where
             false,
         ),
         RuntimeCommand::Shutdown { ticket } => {
+            scheduler
+                .request_all_cancellation(domain_contracts::CancellationReason::RuntimeShutdown);
             let result = runtime.shutdown();
             let should_stop = result.is_ok();
             (RuntimeEvent::Shutdown { ticket, result }, should_stop)

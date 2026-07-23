@@ -3,10 +3,16 @@
 #![forbid(unsafe_code)]
 
 mod output;
+mod token_output;
 
 pub use output::{
     OutputConsumer, OutputInitializationError, OutputProducer, OutputPullError, OutputPushError,
     output_accumulator,
+};
+pub use token_output::{
+    TokenOutputBatch, TokenOutputConsumer, TokenOutputCursor, TokenOutputInitializationError,
+    TokenOutputProducer, TokenOutputRecord, TokenOutputRecordKind, TokenRange,
+    token_output_accumulator,
 };
 
 use std::error::Error;

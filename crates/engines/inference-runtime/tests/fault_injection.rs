@@ -278,7 +278,7 @@ fn mismatched_metadata_is_explicitly_cleaned_without_publication() {
 }
 
 #[test]
-fn model_cleanup_failure_is_reported_without_publishing_accounting() {
+fn model_cleanup_failure_preserves_primary_error_ownership_and_accounting() {
     let counts = Rc::new(CleanupCounts::default());
     let faults = Faults::WRONG_MODEL_HANDLE.union(Faults::FAIL_MODEL_CLEANUP);
     let mut runtime = runtime(faults, Rc::clone(&counts));
@@ -286,12 +286,15 @@ fn model_cleanup_failure_is_reported_without_publishing_accounting() {
     let result = load(&mut runtime);
     assert!(matches!(
         result,
-        Err(RuntimeError::Synchronization(
-            SynchronizationError::Backend(_)
-        ))
+        Err(RuntimeError::CleanupFailed(report))
+            if report.primary_failure == inference_runtime::FailureClass::BackendContract
+                && report.cleanup_failure == inference_runtime::FailureClass::Synchronization
     ));
     assert_eq!(counts.model_cleanups.get(), 1);
-    assert_empty(&runtime);
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.loaded_models, 0);
+    assert_eq!(snapshot.pending_cleanup_models, 1);
+    assert_eq!(snapshot.reserved_footprint, model_footprint());
 }
 
 #[test]
@@ -314,11 +317,22 @@ fn failed_sequence_rollback_is_reported_without_registry_mutation() -> TestResul
     let result = start(&mut runtime, loaded.handle, 10, 100);
     assert!(matches!(
         result,
-        Err(RuntimeError::Sequence(SequenceError::Backend(_)))
+        Err(RuntimeError::CleanupFailed(report))
+            if report.primary_failure == inference_runtime::FailureClass::BackendContract
+                && report.cleanup_failure == inference_runtime::FailureClass::Sequence
     ));
     assert_eq!(counts.sequence_creations.get(), 1);
     assert_eq!(counts.sequence_destructions.get(), 1);
-    assert_only_model_reserved(&runtime);
+    let snapshot = runtime.snapshot();
+    assert_eq!(snapshot.active_requests, 0);
+    assert_eq!(snapshot.pending_cleanup_sequences, 1);
+    assert_eq!(snapshot.reserved_footprint, checked_total_footprint());
+    assert!(
+        runtime
+            .model_snapshots()
+            .first()
+            .is_some_and(|model| model.degraded)
+    );
     Ok(())
 }
 
@@ -480,6 +494,16 @@ const fn model_footprint() -> MemoryFootprint {
         host_weight_bytes: 100,
         device_weight_bytes: 0,
         host_working_bytes: 10,
+        device_working_bytes: 0,
+        cache_bytes_per_token: 0,
+    }
+}
+
+const fn checked_total_footprint() -> MemoryFootprint {
+    MemoryFootprint {
+        host_weight_bytes: 100,
+        device_weight_bytes: 0,
+        host_working_bytes: 18,
         device_working_bytes: 0,
         cache_bytes_per_token: 0,
     }

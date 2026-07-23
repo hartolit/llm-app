@@ -357,21 +357,22 @@ fn failed_sequence_release_preserves_request_for_retry() -> Result<(), String> {
     let first = runtime.cancel_request(RequestId::new(70), CancellationReason::UserRequested);
     if !matches!(
         first,
-        Err(inference_runtime::RuntimeError::Sequence(
-            SequenceError::Backend(_)
-        ))
+        Err(inference_runtime::RuntimeError::CleanupFailed(report))
+            if report.primary_failure == inference_runtime::FailureClass::Cancellation
+                && report.cleanup_failure == inference_runtime::FailureClass::Sequence
     ) {
         return Err(format!("unexpected first release result: {first:?}"));
     }
-    if runtime.snapshot().active_requests != 1 {
-        return Err("failed sequence release removed the request".into());
+    if runtime.snapshot().active_requests != 0 || runtime.snapshot().pending_cleanup_sequences != 1
+    {
+        return Err("failed sequence release did not quarantine ownership".into());
     }
 
-    runtime
-        .cancel_request(RequestId::new(70), CancellationReason::UserRequested)
-        .map_err(debug_error)?;
-    if runtime.snapshot().active_requests != 0 {
-        return Err("successful release retry retained the request".into());
+    if !runtime.poll_cleanup().map_err(debug_error)? {
+        return Err("pending cleanup was not retried".into());
+    }
+    if runtime.snapshot().pending_cleanup_sequences != 0 {
+        return Err("successful release retry retained the sequence".into());
     }
     Ok(())
 }
@@ -595,8 +596,11 @@ fn hosted_worker_retries_a_failed_forced_release() -> Result<(), String> {
     {
         RuntimeEvent::ModelUnload {
             ticket,
-            result: Err(inference_runtime::RuntimeError::Sequence(SequenceError::Backend(_))),
-        } if ticket == CommandTicket::new(82) => {}
+            result: Err(inference_runtime::RuntimeError::CleanupFailed(report)),
+        } if report.primary_failure == inference_runtime::FailureClass::Cancellation
+            && report.cleanup_failure == inference_runtime::FailureClass::Sequence
+            && ticket == CommandTicket::new(82) => {}
+
         _ => return Err("missing initial sequence-release failure".into()),
     }
 

@@ -3385,6 +3385,7 @@ dependencies = [
  "domain-contracts",
  "gguf-backend",
  "host-runtime",
+ "sampling",
 ]
 
 [[package]]
