@@ -1,7 +1,6 @@
 //! Synchronous single-owner registry used directly or through the hosted worker.
 
 use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
 
 use domain_contracts::{
     BackendSequence, CancellationReason, CancellationStatus, CapacityExhausted, CapacityResource,
@@ -149,11 +148,16 @@ where
             plan.expected_footprint,
             self.limits.memory_budget,
         )?;
-        let model = self.loader.load(source, &configuration)?;
-        if model.handle() != handle || model.metadata() != &plan.descriptor.metadata {
-            return Err(RuntimeError::BackendContractViolation);
+        let mut model = self.loader.load(source, &configuration)?;
+        let validation =
+            if model.handle() != handle || model.metadata() != &plan.descriptor.metadata {
+                Err(RuntimeError::BackendContractViolation)
+            } else {
+                lifecycle.complete_load().map(|_| ()).map_err(Into::into)
+            };
+        if let Err(error) = validation {
+            return Err(rollback_model_load(&mut model, error));
         }
-        lifecycle.complete_load()?;
 
         let slot = ModelSlot {
             handle,
@@ -165,12 +169,8 @@ where
             requests: BTreeMap::new(),
             cancelled_requests_during_unload: 0,
         };
-        match self.models.entry(model_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(slot);
-            }
-            Entry::Occupied(_) => return Err(RuntimeError::ModelAlreadyLoaded(model_id)),
-        }
+        let replaced = self.models.insert(model_id, slot);
+        debug_assert!(replaced.is_none(), "model admission was preflighted");
         self.generations.insert(model_id, handle.generation);
         self.reserved_footprint = next_reserved;
 
@@ -212,6 +212,10 @@ where
 
         let current_reserved = self.reserved_footprint;
         let memory_budget = self.limits.memory_budget;
+        let next_active_requests = self
+            .active_requests
+            .checked_add(1)
+            .ok_or(RuntimeError::BackendContractViolation)?;
         let slot = self.exact_model_mut(handle)?;
         match slot.lifecycle.state() {
             ModelLifecycleState::Ready | ModelLifecycleState::Active { .. } => {}
@@ -220,6 +224,9 @@ where
                     domain_contracts::LifecycleError::InvalidTransition,
                 ));
             }
+        }
+        if slot.requests.contains_key(&request_id) {
+            return Err(RuntimeError::RequestAlreadyActive(request_id));
         }
         if slot.requests.len() >= slot.descriptor.capabilities.maximum_sequences as usize {
             return Err(RuntimeError::CapacityExhausted(CapacityExhausted::new(
@@ -230,44 +237,45 @@ where
         }
 
         let plan = slot.model.plan_sequence(&configuration)?;
+        if plan.configuration != configuration {
+            return Err(RuntimeError::BackendContractViolation);
+        }
+        let expected_token_capacity = usize::try_from(plan.configuration.maximum_tokens.get())
+            .map_err(|_| RuntimeError::BackendContractViolation)?;
         let next_reserved =
             admit_footprint(current_reserved, plan.expected_footprint, memory_budget)?;
         let next_slot_reserved =
             checked_add_footprint(slot.reserved_footprint, plan.expected_footprint)?;
-        let sequence = slot.model.create_sequence(sequence_id, &configuration)?;
-        if sequence.id() != sequence_id {
-            return Err(RuntimeError::BackendContractViolation);
+        let mut sequence = slot.model.create_sequence(sequence_id, &configuration)?;
+        if sequence.id() != sequence_id || sequence.token_capacity() != expected_token_capacity {
+            return Err(rollback_sequence_start(
+                &mut slot.model,
+                &mut sequence,
+                RuntimeError::BackendContractViolation,
+            ));
         }
-        slot.lifecycle.start_request()?;
+        if let Err(error) = slot.lifecycle.start_request() {
+            return Err(rollback_sequence_start(
+                &mut slot.model,
+                &mut sequence,
+                error.into(),
+            ));
+        }
+
         let request = RequestSlot {
             sequence,
             footprint: plan.expected_footprint,
             usage: GenerationUsage::default(),
         };
-        match slot.requests.entry(request_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(request);
-            }
-            Entry::Occupied(_) => {
-                slot.lifecycle.finish_request()?;
-                return Err(RuntimeError::RequestAlreadyActive(request_id));
-            }
-        }
+        let replaced = slot.requests.insert(request_id, request);
+        debug_assert!(replaced.is_none(), "request admission was preflighted");
         slot.reserved_footprint = next_slot_reserved;
 
-        match self.request_index.entry(request_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(handle.id);
-            }
-            Entry::Occupied(_) => return Err(RuntimeError::BackendContractViolation),
-        }
-        match self.sequence_index.entry(sequence_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(request_id);
-            }
-            Entry::Occupied(_) => return Err(RuntimeError::BackendContractViolation),
-        }
-        self.active_requests = self.active_requests.saturating_add(1);
+        let previous_model = self.request_index.insert(request_id, handle.id);
+        debug_assert!(previous_model.is_none(), "request index was preflighted");
+        let previous_request = self.sequence_index.insert(sequence_id, request_id);
+        debug_assert!(previous_request.is_none(), "sequence index was preflighted");
+        self.active_requests = next_active_requests;
         self.reserved_footprint = next_reserved;
 
         Ok(RequestStartReceipt {
@@ -831,6 +839,30 @@ where
             status: UnloadStatus::AlreadyAbsent,
             cancelled_requests: 0,
         })
+    }
+}
+
+fn rollback_model_load<M>(model: &mut M, cause: RuntimeError) -> RuntimeError
+where
+    M: LoadedModel,
+{
+    match model.prepare_unload() {
+        Ok(()) => cause,
+        Err(error) => RuntimeError::Synchronization(error),
+    }
+}
+
+fn rollback_sequence_start<M>(
+    model: &mut M,
+    sequence: &mut M::Sequence,
+    cause: RuntimeError,
+) -> RuntimeError
+where
+    M: LoadedModel,
+{
+    match model.destroy_sequence(sequence) {
+        Ok(()) => cause,
+        Err(error) => RuntimeError::Sequence(error),
     }
 }
 

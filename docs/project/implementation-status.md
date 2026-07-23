@@ -2,9 +2,9 @@
 
 **Status date:** 2026-07-23
 
-**Source baseline:** uncommitted Phase 1 working tree based on commit `20fa777a35021e6f80c88542e7e02015c47b8f65`
+**Source baseline:** uncommitted Phase 2 working tree based on commit `1c84b28d8052e66c515c0974cfd959351fc62e0b`
 
-**Execution position:** Phase 1 quality gate implemented and validated locally; Phase 2 has not started
+**Execution position:** Phase 2 transactional runtime safety implemented and validated locally; Phase 3 has not started
 
 **Canonical plan:** [LLM App Execution Plan](../execution/execution-plan.md)
 
@@ -45,7 +45,9 @@ No current user-facing path performs prompt → tokenize → context admission �
 - Portable `domain-contracts`, tokenization, context-planning, sampling, and task-graph crates.
 - Candle CPU and GGUF CPU adapters with backend contract tests.
 - Exclusive-owner inference runtime with bounded hosted transport, lifecycle state, memory admission, cancellation, draining, and unload.
+- Prepare/validate/commit model-load and request-start transactions with explicit native rollback and deterministic fault-injection coverage.
 - Frontend-neutral application façade for Hugging Face resolution, tokenizer validation, redb persistence, Candle model lifecycle, normalized events, and corrective workflows.
+- Checked bounded shutdown deadlines, explicit Slint close-path shutdown, and deterministic disconnection, timeout, join-failure, cancellation, and unload-failure tests.
 - Thin Slint lifecycle frontend.
 - Package-local correctness, allocation, compatibility, and workflow tests plus one Criterion sampling benchmark.
 - Typed, fail-closed architecture and external-dependency validation with full layer-matrix and real-workspace integration coverage.
@@ -55,7 +57,7 @@ Component details are indexed by the [documentation map](../README.md).
 
 ## Reproducible validation evidence
 
-Local validation ran on 2026-07-23 from the uncommitted Phase 1 working tree based on commit `20fa777a35021e6f80c88542e7e02015c47b8f65`. A remote CI run URL cannot exist until the change is pushed; `.github/workflows/quality.yml` is configured to run on every push and pull request.
+Local validation ran on 2026-07-23 from the uncommitted Phase 2 working tree based on commit `1c84b28d8052e66c515c0974cfd959351fc62e0b`. A remote CI run URL cannot exist until the change is pushed; `.github/workflows/quality.yml` is configured to run on every push and pull request.
 
 Toolchain and installed targets:
 
@@ -87,14 +89,14 @@ lychee --config lychee.toml --offline '**/*.md'
 
 Results:
 
-- 90 ordinary tests passed; zero failed;
+- 104 ordinary tests passed; zero failed;
 - Clippy and rustdoc completed with zero warnings under `-D warnings`;
 - all workspace benchmark targets compiled;
 - both named non-host library target checks passed for all five portable feature crates;
 - the full workspace graph passed `cargo-deny 0.20.2` advisories, dependency bans, licenses, and sources with five documented transitive advisory exceptions;
 - Lychee 0.24.2 checked 72 Markdown links: 62 valid, 10 external/offline exclusions, zero errors;
 - `cargo tree -d --locked` remains an audit report: metadata contains 57 duplicated package names spanning 120 package-version entries; no blanket deduplication is required;
-- `desktop-slint` release binary size was 46,540,808 bytes for `x86_64-unknown-linux-gnu` using the default release profile.
+- the last recorded Phase 1 `desktop-slint` release binary size was 46,540,808 bytes for `x86_64-unknown-linux-gnu` using the default release profile; Phase 2 did not rerun that size measurement.
 
 No product binary was launched and no real external model was exercised by this quality-gate validation.
 
@@ -103,8 +105,7 @@ No product binary was launched and no real external model was exercised by this 
 - The CI workflow is present, but this uncommitted working tree has no remote CI run URL yet; required-branch protection must be configured in the repository host after the workflow is pushed.
 - CI currently names Ubuntu 24.04 / `x86_64-unknown-linux-gnu` as the host platform. Windows and macOS jobs remain deferred until native toolchains are documented.
 - Scheduled external-link checks depend on third-party site availability; pull-request link checks intentionally validate repository-local links offline.
-- Model loading and request start still need the transactional rollback work specified by Phase 2.
-- Normal shutdown relies on callers invoking explicit bounded shutdown; frontend closure coverage remains incomplete.
+- Explicit bounded shutdown remains a caller obligation for any future non-Slint frontend; blocking `Drop` is intentionally not a fallback.
 - E1 exposes configuration capacity below it but represents only one loaded model generation.
 - Candle’s upstream cache and GGUF’s native execution do not support a repository-wide allocation-free backend claim.
 - Real-model smoke testing is target-machine work and is not part of the baseline command above.

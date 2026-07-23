@@ -141,6 +141,12 @@ Model shutdown remains deterministic at the inference boundary:
 4. join the completed worker, or detach it at process shutdown if a backend call
    has failed to return.
 
+All shutdown and join deadlines use checked `Instant` arithmetic and each poll or
+sleep is capped to the remaining budget. Timeout overflow is rejected as invalid
+configuration rather than panicking. Explicit `ApplicationRuntime::shutdown` is
+mandatory on normal frontend closure because `Drop` intentionally performs no
+unbounded join; the Slint runner calls it immediately after the window loop exits.
+
 Hub resolution is different. The upstream synchronous `hf-hub` builder exposes
 cache, authentication, retry, endpoint, and progress controls, but no global
 request timeout or cancellation handle. The application runtime sends a

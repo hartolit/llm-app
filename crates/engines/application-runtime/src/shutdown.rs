@@ -1,9 +1,15 @@
 //! Bounded cooperative shutdown for application-owned host workers.
+//!
+//! Frontends must call [`ApplicationRuntime::shutdown`] on normal closure; dropping the runtime
+//! intentionally does not perform an unbounded worker join.
 
 use std::time::{Duration, Instant};
 
 use host_runtime::{HostThread, SendTimeoutError, yield_now};
-use inference_runtime::{RuntimeCommand, RuntimeEvent, RuntimeThread};
+use inference_runtime::{
+    CommandTicket, HostedRuntime, RuntimeCommand, RuntimeError, RuntimeEvent, RuntimeThread,
+    ShutdownReceipt,
+};
 
 use crate::hub_worker::HubCommand;
 use crate::support::thread_failure;
@@ -46,19 +52,43 @@ fn shutdown_runtime(runtime: &mut ApplicationRuntime) -> Result<(), ApplicationE
     if !runtime.state.inference_available() {
         return Ok(());
     }
-    while runtime.inference.try_receive().is_ok() {}
     let ticket = runtime.next_ticket()?;
-    let deadline = Instant::now() + runtime.configuration.timing.runtime_shutdown_timeout;
+    let outcome = shutdown_runtime_worker(
+        &runtime.inference,
+        ticket,
+        runtime.configuration.timing.runtime_shutdown_timeout,
+        runtime.configuration.timing.runtime_shutdown_event_poll,
+    )?;
+    runtime.state.disconnect_inference();
+    normalize_runtime_shutdown(outcome)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeShutdown {
+    Disconnected,
+    Finished(Result<ShutdownReceipt, RuntimeError>),
+}
+
+fn shutdown_runtime_worker<S>(
+    runtime: &HostedRuntime<S>,
+    ticket: CommandTicket,
+    timeout: Duration,
+    event_poll: Duration,
+) -> Result<RuntimeShutdown, ApplicationError> {
+    while runtime.try_receive().is_ok() {}
+    let deadline = checked_deadline(
+        timeout,
+        crate::ApplicationConfigurationField::RuntimeShutdownTimeout,
+    )?;
     let mut pending = RuntimeCommand::Shutdown { ticket };
     loop {
-        match runtime.inference.try_submit(pending) {
+        match runtime.try_submit(pending) {
             Ok(()) => break,
             Err(inference_runtime::RuntimeSubmitError::Disconnected(_)) => {
-                runtime.state.disconnect_inference();
-                return Ok(());
+                return Ok(RuntimeShutdown::Disconnected);
             }
             Err(inference_runtime::RuntimeSubmitError::Full(command)) => {
-                if Instant::now() >= deadline {
+                if remaining_until(deadline).is_none() {
                     return Err(ApplicationError::RuntimeBusy);
                 }
                 pending = command;
@@ -68,35 +98,33 @@ fn shutdown_runtime(runtime: &mut ApplicationRuntime) -> Result<(), ApplicationE
     }
 
     loop {
-        if Instant::now() >= deadline {
-            return Err(ApplicationError::ShutdownTimeout(
-                ApplicationWorker::Inference,
-            ));
-        }
-        match runtime
-            .inference
-            .receive_timeout(runtime.configuration.timing.runtime_shutdown_event_poll)
-        {
+        let remaining = remaining_until(deadline).ok_or(ApplicationError::ShutdownTimeout(
+            ApplicationWorker::Inference,
+        ))?;
+        match runtime.receive_timeout(event_poll.min(remaining)) {
             Ok(RuntimeEvent::Shutdown {
                 ticket: event_ticket,
                 result,
-            }) if event_ticket == ticket => {
-                runtime.state.disconnect_inference();
-                return result.map(|_| ()).map_err(|error| {
-                    ApplicationFailure::from_debug(
-                        ApplicationFailureKind::Inference,
-                        "inference shutdown failed",
-                        error,
-                    )
-                    .into()
-                });
-            }
+            }) if event_ticket == ticket => return Ok(RuntimeShutdown::Finished(result)),
             Ok(_) | Err(inference_runtime::RuntimeReceiveError::Timeout) => {}
             Err(inference_runtime::RuntimeReceiveError::Disconnected) => {
-                runtime.state.disconnect_inference();
-                return Ok(());
+                return Ok(RuntimeShutdown::Disconnected);
             }
         }
+    }
+}
+
+fn normalize_runtime_shutdown(outcome: RuntimeShutdown) -> Result<(), ApplicationError> {
+    match outcome {
+        RuntimeShutdown::Disconnected => Ok(()),
+        RuntimeShutdown::Finished(result) => result.map(|_| ()).map_err(|error| {
+            ApplicationFailure::from_debug(
+                ApplicationFailureKind::Inference,
+                "inference shutdown failed",
+                error,
+            )
+            .into()
+        }),
     }
 }
 
@@ -116,11 +144,19 @@ fn join_hub_worker(runtime: &mut ApplicationRuntime) -> Result<(), ApplicationEr
     let Some(thread) = runtime.hub_thread.take() else {
         return Ok(());
     };
-    wait_for_host_thread(
-        &thread,
+    finish_host_thread(
+        thread,
         runtime.configuration.timing.hub_shutdown_timeout,
         runtime.configuration.timing.hub_shutdown_poll,
-    )?;
+    )
+}
+
+fn finish_host_thread(
+    thread: HostThread<()>,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<(), ApplicationError> {
+    wait_for_host_thread(&thread, timeout, poll)?;
     thread.join().map_err(thread_failure)
 }
 
@@ -129,14 +165,15 @@ fn wait_for_runtime_thread(
     timeout: Duration,
     poll: Duration,
 ) -> Result<(), ApplicationError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = checked_deadline(
+        timeout,
+        crate::ApplicationConfigurationField::RuntimeJoinTimeout,
+    )?;
     while !thread.is_finished() {
-        if Instant::now() >= deadline {
-            return Err(ApplicationError::ShutdownTimeout(
-                ApplicationWorker::Inference,
-            ));
-        }
-        std::thread::sleep(poll);
+        let remaining = remaining_until(deadline).ok_or(ApplicationError::ShutdownTimeout(
+            ApplicationWorker::Inference,
+        ))?;
+        std::thread::sleep(poll.min(remaining));
     }
     Ok(())
 }
@@ -146,14 +183,31 @@ fn wait_for_host_thread(
     timeout: Duration,
     poll: Duration,
 ) -> Result<(), ApplicationError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = checked_deadline(
+        timeout,
+        crate::ApplicationConfigurationField::HubShutdownTimeout,
+    )?;
     while !thread.is_finished() {
-        if Instant::now() >= deadline {
-            return Err(ApplicationError::ShutdownTimeout(ApplicationWorker::Hub));
-        }
-        std::thread::sleep(poll);
+        let remaining = remaining_until(deadline)
+            .ok_or(ApplicationError::ShutdownTimeout(ApplicationWorker::Hub))?;
+        std::thread::sleep(poll.min(remaining));
     }
     Ok(())
+}
+
+fn checked_deadline(
+    timeout: Duration,
+    field: crate::ApplicationConfigurationField,
+) -> Result<Instant, ApplicationError> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(ApplicationError::InvalidConfiguration(field))
+}
+
+fn remaining_until(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn record_first_error(first: &mut Option<ApplicationError>, candidate: Option<ApplicationError>) {
@@ -161,3 +215,6 @@ fn record_first_error(first: &mut Option<ApplicationError>, candidate: Option<Ap
         *first = candidate;
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -39,10 +39,19 @@ A request sequence is admitted only when:
 - the backend model's maximum sequence count has capacity;
 - its sequence plan fits the remaining aggregate memory budget.
 
-Accounting is updated only after successful ownership transfer. Sequence bytes
-are released when the request is completed or cancelled. Model bytes are
-released only after `prepare_unload` and the lifecycle's `complete_unload`
-transition succeed.
+Admission uses prepare/validate/commit transactions. A newly loaded model remains
+local until its handle, metadata, and lifecycle have been validated; any
+post-load failure calls `prepare_unload` before the model is dropped. A newly
+created sequence remains local until its identity, token capacity, lifecycle,
+and every registry entry are ready to commit; any abandoned sequence calls
+`destroy_sequence`. Backend plans that contradict the requested sequence
+configuration are rejected before native creation.
+
+Accounting and indexes are updated only in the final commit after successful
+ownership transfer. A failed transaction therefore leaves no model/request
+registry or memory-accounting mutation. Sequence bytes are released when the
+request is completed or cancelled. Model bytes are released only after
+`prepare_unload` and the lifecycle's `complete_unload` transition succeed.
 
 ## Drain and cancellation
 
